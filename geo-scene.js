@@ -84,7 +84,7 @@ window.FloodGeoScene = (() => {
   async function loadData(){
     if(window.FloodLocalGeoData)return window.FloodLocalGeoData;
     if(!dataPromise)dataPromise=Promise.all(['buildings','roads','water','landuse','labels'].map(async name=>{
-      const response=await fetch(`data/xuzhou-${name}.geojson`);if(!response.ok)throw new Error(`地理数据加载失败: ${name}`);return [name,await response.json()];
+      const response=await fetch(`xuzhou-${name}.geojson`);if(!response.ok)throw new Error(`地理数据加载失败: ${name}`);return [name,await response.json()];
     })).then(entries=>Object.fromEntries(entries));
     return dataPromise;
   }
