@@ -1,0 +1,19 @@
+/* Primary workspaces stay short; related tasks live together in context. */
+#workspace-tabs{margin:-4px 0 22px;min-width:0}
+.workspace-tabs{display:flex;flex-wrap:wrap;gap:5px;border-bottom:1px solid #29414e;padding:0 0 10px}
+.workspace-tabs button{padding:8px 16px;background:transparent;border-color:transparent;border-radius:6px;font-size:13px;color:#9fb9c7;min-height:39px}
+.workspace-tabs button:hover{background:#142e3b;color:#e0f1f5}
+.workspace-tabs button.active{background:#173e37;border-color:#326553;color:#8cecd1;font-weight:600}
+#nav button{min-height:47px}
+#nav .nav-bottom{line-height:1.9;letter-spacing:1px}
+.teaching-brief{display:flex;align-items:flex-start;gap:14px;padding:17px 20px;margin-bottom:18px;background:#122c39;border:1px solid #2c4857;border-radius:8px}
+.teaching-brief b{font-size:14px;font-weight:500}.teaching-brief p{font-size:12px;color:#9fb7c5;line-height:1.8;margin:4px 0 0}
+.teaching-road-details{border:1px solid #294451;border-radius:8px;background:#102431;overflow:hidden}
+.teaching-road-details>summary{cursor:pointer;padding:15px 19px;font-size:13px;font-weight:500;color:#c5e1e6}
+.teaching-road-details[open]>summary{border-bottom:1px solid #294451}
+.teaching-road-details .panel-head{padding:10px 19px}.teaching-road-details .panel-head .hint{font-size:12px}
+.planning-jump{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:#a1b9c6;margin-bottom:17px}
+.planning-jump button{font-size:12px;min-height:36px}
+#teaching-plan,#teaching-dispatch{scroll-margin-top:20px}
+body[data-workspace=content] .topline,body[data-page=command-room] .topline{margin-bottom:22px}
+@media(max-width:760px){#workspace-tabs{margin:0 0 16px}.workspace-tabs{gap:3px;flex-wrap:nowrap;overflow-x:auto;padding-bottom:8px}.workspace-tabs button{flex-shrink:0;padding:7px 11px;font-size:12px;min-height:37px}#nav button{min-height:37px;padding:8px 12px}.teaching-brief{padding:13px;gap:10px}.teaching-brief p{font-size:11px}.teaching-brief .tag{font-size:10px}.planning-jump{align-items:flex-start;flex-direction:column;gap:8px}.teaching-road-details>summary{padding:14px}.teaching-road-details .panel-head{flex-wrap:wrap;padding:11px 14px}}

@@ -1,0 +1,109 @@
+{
+  "region": "江苏省徐州市云龙湖东北岸及周边城区",
+  "bbox_wgs84": [
+    117.13,
+    34.23,
+    117.205,
+    34.29
+  ],
+  "source_zoom": 14,
+  "retrieved_at_utc": "2026-10-17T07:40:01.668977+00:00",
+  "source": "OpenFreeMap public vector tiles derived from OpenStreetMap using the OpenMapTiles schema",
+  "tilejson_url": "https://tiles.openfreemap.org/planet",
+  "source_tile_urls": [
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6532.pbf"
+  ],
+  "counts": {
+    "buildings": 28,
+    "roads": 847,
+    "water": 67,
+    "landuse": 255,
+    "labels": 832
+  },
+  "building_polygon_parts": 857,
+  "building_polygon_parts_by_render_height": {
+    "5": 839,
+    "30": 1,
+    "11": 2,
+    "22": 6,
+    "60": 1,
+    "74": 1,
+    "110": 1,
+    "35": 1,
+    "100": 3,
+    "120": 1,
+    "26": 1
+  },
+  "near_views": [
+    {
+      "center": [
+        117.176451,
+        34.264271
+      ],
+      "polygon_parts_in_approx_300m_cell": 41,
+      "suggested_zoom": 16.7,
+      "suggested_pitch": 58
+    },
+    {
+      "center": [
+        117.18239,
+        34.252245
+      ],
+      "polygon_parts_in_approx_300m_cell": 34,
+      "suggested_zoom": 16.7,
+      "suggested_pitch": 58
+    }
+  ],
+  "skyline_view": {
+    "center": [
+      117.179502,
+      34.270345
+    ],
+    "polygon_parts_in_approx_300m_cell": 24,
+    "parts_with_render_height_above_20m": 3,
+    "suggested_zoom": 16.5,
+    "suggested_pitch": 58
+  },
+  "attribution": "OpenFreeMap © OpenMapTiles · © OpenStreetMap contributors",
+  "license": "ODbL-1.0",
+  "license_url": "https://www.openstreetmap.org/copyright",
+  "schema_url": "https://openmaptiles.org/docs/schema/",
+  "geographic_note": "道路、水体、土地和建筑轮廓来自公开地图数据，不保证完整、实时或测绘精度；瓦片缓冲区已按瓦片核心和研究范围裁剪。",
+  "height_note": "render_height/render_min_height 为上游地图按 OSM 高度/楼层等标签计算的近似渲染高度，可能包含上游默认值；不是本项目实测楼高。未生成补充或虚构建筑。",
+  "count_note": "counts 统计 GeoJSON feature 数量；上游将许多同高建筑聚合为 MultiPolygon，因此 building_polygon_parts 另列独立 Polygon 组件数，它们也不等同于经核实的独立楼栋数。",
+  "simulation_note": "教学任务点、人口、积水深度、道路灾损、抢修工期与预算另由教学模型设定；此文件不代表真实灾情。",
+  "id_note": "_source_feature_id 仅指 MVT 原始 feature ID，不承诺是 OSM 对象 ID；原始可用 properties 已保留。",
+  "processing": "MVT decoded to WGS84 GeoJSON, trimmed at tile cores and study bbox, same source-ID/properties fragments merged; no new footprints or fabricated heights.",
+  "rebuild_command": "python work/prepare_xuzhou_map.py --cached",
+  "files": {
+    "buildings": "xuzhou-buildings.geojson",
+    "roads": "xuzhou-roads.geojson",
+    "water": "xuzhou-water.geojson",
+    "landuse": "xuzhou-landuse.geojson",
+    "labels": "xuzhou-labels.geojson"
+  }
+}
