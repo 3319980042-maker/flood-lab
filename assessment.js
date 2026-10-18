@@ -14,7 +14,7 @@ const questions=[
   {id:'repair',title:'更换设备并恢复效率',detail:'投入 5 万元，消除新增工期。',points:5,reason:'恢复排涝能力，减少后续作业等待；收益取决于剩余排涝任务。',cost:5,penalty:0},
   {id:'remote',title:'远程排障，部分恢复',detail:'投入 2 万元，将新增工期降至 10 分钟。',points:3,reason:'节约投入但保留部分工期延误，是受预算约束时的折中。',cost:2,penalty:10},
   {id:'continue',title:'保持故障状态继续作业',detail:'不追加投入，每项排涝作业仍增加 15 分钟。',points:0,reason:'保留预算，但排涝任务持续变慢，需自行承担对通道恢复的影响。',cost:0,penalty:15}]}];
-function start(){const s=E.create('rising');s.budget=55;s.initial.budget=55;s.assessment={version:1,phase:'active',pending:'priority',answers:[],operations:[],pumpPenalty:0,final:null};E.log(s,'开始决策考核：固定 180 分钟、55 万元；首轮决策待处理');return s;}
+function start(){const s=E.create('rising');s.budget=55;s.initial.budget=55;s.assessment={version:1,scoringVersion:2,phase:'active',pending:'priority',answers:[],operations:[],pumpPenalty:0,final:null};E.log(s,'开始决策考核：固定 180 分钟、55 万元；首轮决策待处理');return s;}
 function active(s){return s.assessment?.phase==='active';}
 function addOperation(s,kind,text,extra={}){if(active(s))s.assessment.operations.push({time:s.time,kind,text,...extra});}
 function canChoose(s,qid,oid){if(!active(s)||s.assessment.pending!==qid)return '当前没有这项待处理决策';const q=questions.find(v=>v.id===qid),o=q?.options.find(v=>v.id===oid);if(!o)return '决策选项不存在';if(!s.identification)return '请先提交初始孤岛识别';if(o.dispatch){const trial=E.clone(s);trial.assessment=null;for(const [id,cid]of o.dispatch){const result=E.dispatch(trial,id,cid);if(result.error)return result.error;}}if(s.spent+(o.cost||0)>s.budget)return '剩余预算不足';return null;}
@@ -23,7 +23,7 @@ function choose(s,qid,oid){const error=canChoose(s,qid,oid);if(error)return {err
 function dispatchRecorded(s,id,cid,error){if(!active(s))return;addOperation(s,error?'invalid':'dispatch',error?`${id} / ${cid} 派遣被拒绝：${error}`:`派遣 ${cid} 抢修 ${id}`,{edge:id,crew:cid});if(!error&&cid==='P1'&&s.assessment.pumpPenalty){const c=s.crews.find(v=>v.id===cid);c.job.end+=s.assessment.pumpPenalty;c.job.duration+=s.assessment.pumpPenalty;E.log(s,'排涝设备故障使本项任务增加 '+s.assessment.pumpPenalty+' 分钟');}}
 function checkpoint(s){if(!active(s))return false;const a=s.assessment;if(a.pending)return true;const q=questions.find(q=>q.at<=s.time&&!a.answers.some(v=>v.id===q.id));if(!q)return false;a.pending=q.id;if(q.id==='equipment'){a.pumpPenalty=15;const c=s.crews.find(v=>v.id==='P1');if(c.job){c.job.end+=15;c.job.duration+=15;}}
  E.log(s,'决策考核暂停：'+q.title);return true;}
-function evaluate(s){const a=s.assessment,st=E.stats(s),baseline=s.timeline[0].available,initialLost=st.pop-baseline;const recovery=n=>initialLost?Math.min(1,Math.max(0,(n-baseline)/initialLost)):1;const restored=recovery(st.available);let area=0;for(let i=0;i<s.timeline.length;i++){const t=s.timeline[i],end=s.timeline[i+1]?.time??180;area+=recovery(t.available)*Math.max(0,end-t.time);}
+function evaluateLegacy(s){const a=s.assessment,st=E.stats(s),baseline=s.timeline[0].available,initialLost=st.pop-baseline;const recovery=n=>initialLost?Math.min(1,Math.max(0,(n-baseline)/initialLost)):1;const restored=recovery(st.available);let area=0;for(let i=0;i<s.timeline.length;i++){const t=s.timeline[i],end=s.timeline[i+1]?.time??180;area+=recovery(t.available)*Math.max(0,end-t.time);}
  const f1=s.identification?(s.identification.truth.length+s.identification.answer.length?2*s.identification.answer.filter(v=>s.identification.truth.includes(v)).length/(s.identification.truth.length+s.identification.answer.length):1):0;
  const early=['B','H'].map(id=>({id,at:s.timeline.find(t=>t.urgentIds.includes(id))?.time??null,reachable:st.reachable.has(id)}));
  const urgent=early.reduce((sum,n)=>sum+(n.reachable?(n.at!==null&&n.at<=90?10:6):0),0);
@@ -38,11 +38,12 @@ function evaluate(s){const a=s.assessment,st=E.stats(s),baseline=s.timeline[0].a
   {key:'resources',name:'预算利用',max:10,score:round(10*restored*(s.spent<=40?1:Math.max(0,1-.4*(s.spent-40)/15))),reason:`投入 ${s.spent}/55 万元；仅对实际恢复比例计分。40 万元以内系数为 1，40–55 万元线性下降至 0.6，避免“不做任务只省钱”得高分。`},
   {key:'operations',name:'派遣规范',max:10,score:dispatches?Math.max(0,10-2*invalid):0,reason:`成功派遣 ${dispatches} 次，无效派遣 ${invalid} 次；每次无效派遣扣 2 分，最低 0 分，未成功派遣计 0 分。`}
  ];const total=round(rows.reduce((sum,v)=>sum+v.score,0));return {total,level:total>=85?'优秀':total>=70?'良好':total>=60?'合格':'需改进',rows,decisions,invalid,dispatches,time:s.time,spent:s.spent,available:st.available,early};}
+function evaluate(s){if(s.assessment.scoringVersion!==2)return evaluateLegacy(s);const result=E.decisionEvaluation(s);const decisions=s.assessment.answers.map(v=>{const q=questions.find(q=>q.id===v.id),o=q.options.find(o=>o.id===v.option);return {...v,title:q.title,label:o.title,reason:o.reason};});return {...result,decisions};}
 function finalize(s){if(!active(s)||s.time<180||s.assessment.pending)return false;const a=s.assessment;a.final=evaluate(s);a.phase='finished';s.ended=true;E.log(s,'决策考核完成：'+a.final.total+' / 100 分');return true;}
 function validateAssessment(s){
  const a=s.assessment;if(a==null)return;
  const fail=()=>{throw new Error('决策考核记录不完整或格式无效')};
- if(a.version!==1||!['active','finished'].includes(a.phase)||![null,...questions.map(q=>q.id)].includes(a.pending)||![0,10,15].includes(a.pumpPenalty)||s.scenario!=='rising'||s.rain!==80||s.budget!==55)fail();
+ if((a.scoringVersion!==undefined&&a.scoringVersion!==2)||a.version!==1||!['active','finished'].includes(a.phase)||![null,...questions.map(q=>q.id)].includes(a.pending)||![0,10,15].includes(a.pumpPenalty)||s.scenario!=='rising'||s.rain!==80||s.budget!==55)fail();
  if(!Array.isArray(a.answers)||a.answers.length>3)fail();
  a.answers.forEach((v,i)=>{const q=questions[i];if(!v||q.id!==v.id||!q.options.some(o=>o.id===v.option)||v.time!==q.at||v.time>s.time)fail()});
  const next=questions[a.answers.length];
@@ -62,7 +63,7 @@ E.configure=function(s,v){return s.assessment?{error:'考核情景参数已锁�
 E.configureEdge=function(s,...v){return s.assessment?{error:'考核初始路况已锁定'}:original.configureEdge(s,...v)};
 E.recommend=function(s){return s.assessment?[]:original.recommend(s)};
 E.validate=function(raw){const s=original.validate(raw);validateAssessment(s);return s;};
-E.score=function(s){return s.assessment?(s.assessment.final||evaluate(s)):original.score(s);};
+E.score=function(s){return s.assessment?(s.assessment.scoringVersion===2?evaluate(s):(s.assessment.final||evaluate(s))):original.score(s);};
 root.FloodAssessment={questions,start,active,canChoose,choose,dispatchRecorded,checkpoint,evaluate,finalize,addOperation};
 if(typeof module!=='undefined')module.exports=root.FloodAssessment;
 })(typeof globalThis!=='undefined'?globalThis:this);
