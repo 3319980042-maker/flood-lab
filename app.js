@@ -1,22 +1,1232 @@
+/* Source: frontend/classroom/api.js */
+/*
+ * 课堂前端 / 请求层
+ * 输入：路径、操作数据、会话令牌。
+ * 输出：服务返回的数据和不含令牌的请求记录。
+ * 这里不读写网页、不保存课堂状态，也不计算实验结果。
+ */
+window.FloodClassroomAPI = (() => {
+  'use strict';
+
+  function createClient({ baseUrl = '/api/learning', timeoutMs = 8000 } = {}) {
+    async function request({ path, method = 'GET', body, token } = {}) {
+      const started = Date.now();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      let status = 0;
+      let data;
+
+      try {
+        const headers = {};
+        if (body !== undefined) headers['Content-Type'] = 'application/json';
+        if (token) headers.Authorization = 'Bearer ' + token;
+
+        const response = await fetch(baseUrl + path, {
+          method,
+          headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: controller.signal
+        });
+        status = response.status;
+        const text = await response.text();
+
+        try {
+          data = JSON.parse(text);
+        } catch {
+          throw new Error('当前地址没有启动课堂后端，请使用下方的本地服务入口。');
+        }
+        if (!response.ok) {
+          const error = new Error(data.message || '请求失败');
+          error.code = data.error;
+          throw error;
+        }
+        return { data, trace: trace() };
+      } catch (original) {
+        let error = original;
+        if (original.name === 'AbortError') {
+          error = new Error('服务响应超时，请重试；未确认的操作不会在前端自行执行。');
+        } else if (!status) {
+          error = new Error('未能连接课堂服务，请检查服务窗口是否仍在运行。');
+        }
+        error.serviceUnavailable = !status || status === 404;
+        error.trace = trace();
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      // 只记字段名，不记录姓名、表单值或会话令牌。
+      function trace() {
+        return {
+          method,
+          path: baseUrl + path,
+          fields: body === undefined ? [] : Object.keys(body),
+          status: status || '连接失败',
+          ms: Date.now() - started,
+          version: data?.version,
+          phase: data?.phase
+        };
+      }
+    }
+
+    return Object.freeze({ request });
+  }
+
+  return Object.freeze({ createClient });
+})();
+
+;
+/* Source: frontend/classroom/views.js */
+/*
+ * 课堂前端 / 显示层
+ * view(model)、renderReport(model) 只接收页面模型并返回 HTML。
+ * 不访问 DOM、网络、存储，不产生实验结果。地图容器由 controller 提供。
+ */
+window.FloodClassroomViews = (() => {
+  'use strict';
+
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[character]);
+  const roles = { teacher: '教学组织者', student: '学生', observer: '观察者' };
+  const types = { road: '道路清障', pump: '排涝', bridge: '桥梁加固' };
+  const roadStates = { blocked: '阻断', repair: '作业中', limited: '限行', open: '通行' };
+  const tools = [
+    ['observe', '观察地图', '先了解路况', 'map'],
+    ['route', '两点寻路', '起点与终点', 'route'],
+    ['identify', '孤岛识别', '判断断连聚落', 'target'],
+    ['predict', '决策预测', '先判断后验证', 'chart'],
+    ['dispatch', '通道抢通', '选择道路与队伍', 'route'],
+    ['events', '过程记录', '查看小组操作', 'list']
+  ];
+
+  // 图标使用内联 SVG，避免新增资源依赖。
+  function icon(name) {
+    const paths = {
+      map: '<path d="m3 5 6-2 6 2 6-2v16l-6 2-6-2-6 2Z"/><path d="M9 3v16M15 5v16"/>',
+      target: '<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>',
+      chart: '<path d="M4 3v17h17M7 15l4-5 4 3 5-7"/><path d="M16 6h4v4"/>',
+      route: '<circle cx="5" cy="5" r="2"/><circle cx="19" cy="19" r="2"/><path d="M7 5h9a4 4 0 0 1 0 8H8a4 4 0 0 0 0 8h9"/>',
+      list: '<path d="M8 6h12M8 12h12M8 18h12M3 6h1M3 12h1M3 18h1"/>',
+      arrow: '<path d="M4 12h16m-6-6 6 6-6 6"/>',
+      users: '<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M19 20v-2a6 6 0 0 0-3-5"/>',
+      check: '<path d="m5 12 4 4L19 6"/>'
+    };
+    return `<svg class="lc-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.map}</svg>`;
+  }
+
+  function header(model) {
+    const { snapshot: s, online, explain } = model;
+    const stageTitle = !s ? '开始一轮课堂实验' : ({ draft: '准备本轮任务', running: s.title, finished: '实验报告与学习复盘' })[s.phase];
+    if (s?.phase === 'running') return `<header class="lc-top lc-map-top"><div class="lc-heading"><h2>${esc(s.title)}</h2><span class="lc-map-session">实验进行中 · ${esc(s.code)} · ${esc(roles[s.role] || s.role)}</span></div><div class="lc-header-actions"><span class="lc-service ${online ? 'is-online' : ''}"><i></i>${online ? '已连接' : '等待连接'}</span><button data-learning="explain" aria-expanded="${Boolean(explain)}">课堂指南</button><button data-learning="refresh">刷新</button><button data-learning="disconnect">返回入口</button></div></header>`;
+    return `<header class="lc-top">
+      <div class="lc-heading"><span class="lc-kicker">交通孤岛 · 教学工作区</span><h2>${esc(stageTitle)}</h2></div>
+      <div class="lc-header-actions"><span class="lc-service ${online ? 'is-online' : ''}"><i></i>${online ? '课堂已连接' : '等待课堂连接'}</span>
+        <button data-learning="explain" aria-expanded="${Boolean(explain)}">${explain ? '收起指南' : '课堂指南'}</button><button data-nav="home">课程目录</button>
+      </div>
+    </header>${s ? `<div class="lc-stage"><ol class="lc-steps">${[['draft', '01', '设置'], ['running', '02', '实验'], ['finished', '03', '报告']].map(([phase, number, title]) => `<li class="${s.phase === phase ? 'current' : ''}" ${s.phase === phase ? 'aria-current="step"' : ''}><small>${number}</small>${title}</li>`).join('')}</ol>
+      <div class="lc-session-info"><span>实验码 <b>${esc(s.code)}</b></span><span class="lc-role">${esc(roles[s.role] || s.role)}</span></div>
+      <div class="lc-session-actions"><button data-learning="refresh">刷新</button><button data-learning="disconnect">返回入口</button></div>
+    </div>` : ''}`;
+  }
+
+  function loadingView() {
+    return `<section class="lc-empty"><span class="lc-kicker">课堂工作区</span><h2>连接教学服务</h2><p>正在读取本轮课堂条件与实验记录。</p></section>`;
+  }
+
+  function offlineView() {
+    return `<section class="lc-empty"><span class="lc-kicker">本地启动</span><h2>先启动本地课堂服务</h2><p>课堂服务负责保存实验、检查预算与同步小组操作。</p>
+      <ol><li>打开维护源码目录 <code>work/flood-lab</code>。</li><li>双击 <b>启动课堂框架.cmd</b>，提示就绪后可关闭启动窗口。</li><li>访问 <a href="http://127.0.0.1:8770/#classroom">http://127.0.0.1:8770/#classroom</a>。</li></ol>
+      <p class="hint">GitHub Pages 和本地HTML可继续使用原有离线实验；课堂工作区需要Node.js服务。</p><div class="actions"><button class="primary" data-learning="retry">重新连接</button><button data-nav="home">返回离线课程</button></div></section>`;
+  }
+
+  function introduction(model) {
+    const { catalog, busy, entry, createDraft: c = {}, joinDraft: j = {} } = model;
+    const options = (catalog?.scenarios || []).map(s => `<option value="${esc(s.id)}" ${s.id === c.scenario ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+    const create = `<form id="learning-create" class="lc-card lc-entry-form"><div class="lc-section-title"><div><span class="lc-kicker">教学组织者 / 出题小组</span><h3>创建一轮课堂</h3><p>先选择情景，具体条件在准备区确认。</p></div><button type="button" data-learning-entry="">返回</button></div><label class="field">你的姓名 / 小组<input name="name" maxlength="40" value="${esc(c.name)}" required></label><label class="field">实验名称<input name="title" maxlength="40" value="${esc(c.title)}" required></label><label class="field">实验情景<select name="scenario">${options}</select></label><input type="hidden" name="budget" value="${esc(c.budget)}"><input type="hidden" name="rain" value="${esc(c.rain)}"><button type="submit" class="primary lc-wide" ${busy ? 'disabled' : ''}>创建，进入准备区 ${icon('arrow')}</button></form>`;
+    const join = `<form id="learning-join" class="lc-card lc-entry-form"><div class="lc-section-title"><div><span class="lc-kicker">学生 / 观察者</span><h3>按实验码加入</h3><p>使用组织者分享的六位实验码。</p></div><button type="button" data-learning-entry="">返回</button></div><label class="field">实验码<input name="code" value="${esc(j.code)}" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" placeholder="六位实验码"></label><label class="field">姓名 / 小组<input name="name" value="${esc(j.name)}" required maxlength="40" placeholder="例如：第一小组"></label><label class="field">课堂职责<select name="role"><option value="student" ${j.role === 'student' ? 'selected' : ''}>学生：分析与派遣</option><option value="observer" ${j.role === 'observer' ? 'selected' : ''}>观察者：只读查看</option></select></label><button type="submit" class="primary lc-wide" ${busy ? 'disabled' : ''}>加入课堂 ${icon('arrow')}</button></form>`;
+    return `<section class="lc-access"><div class="lc-access-context"><span class="lc-kicker">准备 → 地图实验 → 学习报告</span><h2>进入你的课堂</h2><p>每次只处理当前阶段的任务。条件在准备区设置，识别、预测和派遣在地图中完成。</p><figure class="lc-entry-photo"><img src="xuzhou-3d-preview.jpg?v=53" alt="徐州云龙湖城市湖岸实拍"><figcaption>摄影：<a href="https://commons.wikimedia.org/wiki/File:20260722_Yunlong_Lake_Xuzhou_05.jpg" target="_blank" rel="noopener">祝鱼贵</a> · <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener">CC BY-SA 4.0</a> · 裁切展示</figcaption></figure><details class="lc-access-note"><summary>本轮教学模型说明</summary><p>真实道路课堂：12个教学地点、17处局部作业任务；道路来自公开地图，人口、灾情与费用为教学设定。</p><button data-nav="real-lab">进入独立真实路网实验 →</button></details></div><div class="lc-access-main">${entry === 'create' ? create : entry === 'join' ? join : `<div class="lc-access-choice"><span class="lc-kicker">课堂接入</span><h3>这次怎样开始？</h3><button class="primary" data-learning-entry="join">${icon('users')}<span><b>加入课堂</b><small>我有组织者提供的实验码</small></span>${icon('arrow')}</button><button data-learning-entry="create">${icon('map')}<span><b>创建课堂</b><small>我要组织实验，或独立练习</small></span>${icon('arrow')}</button></div>`}${model.recentSessions?.length && !entry ? `<details class="lc-recent-sessions" open><summary>继续最近的课堂 <small>${model.recentSessions.length}</small></summary><div class="lc-recent-list">${model.recentSessions.map(item => `<button data-learning-resume="${esc(item.code)}" ${busy ? 'disabled' : ''}><span>${esc(item.title || '课堂实验')}</span><small>${esc(item.code)} · ${esc(roles[item.role] || '课堂成员')} · ${{draft:'待开始',running:'进行中',finished:'已结束'}[item.phase] || '已保存'}</small><b>${item.phase === 'finished' ? '报告' : '继续'} →</b></button>`).join('')}</div><p>本浏览器保留原课堂身份。</p></details>` : ''}</div></section>`;
+  }
+
+
+  function membersView(members) {
+    return `<ul class="lc-member-list">${members.map(member => `<li><span class="lc-member-avatar">${esc(member.name?.slice(0, 1) || '组')}</span><div><b>${esc(member.name)}</b><small>${esc(roles[member.role] || member.role)}</small></div><span class="lc-member-online">已加入</span></li>`).join('')}</ul>`;
+  }
+
+  function preparation(model) {
+    const { snapshot: s, catalog, busy, preparation: tab = 'task' } = model;
+    const locked = s.role !== 'teacher';
+    const config = model.configDraft || s.config;
+    const scenario = catalog.scenarios.find(v => v.id === s.config.scenario);
+    const task = `<section class="lc-task-sheet lc-card"><span class="lc-kicker">本轮任务书</span><h2>有限预算下，怎样恢复更多连通？</h2><p>先找出与基地失去联系的聚落，记录预测；进入地图后选择受阻道路与队伍，观察行动造成的变化。</p><div class="lc-task-baseline"><div><small>初始可达人口</small><strong>${s.stats.available}<em>人</em></strong></div><div><small>初始断连人口</small><strong>${s.stats.isolated}<em>人</em></strong></div><div><small>仿真时限</small><strong>${s.config.horizon || 180}<em>分钟</em></strong></div></div><details class="lc-task-detail"><summary>查看学习目标与模型范围</summary><ol class="lc-task-sequence"><li><span>1</span><div><b>观察与判断</b><p>根据路网连通关系判断初始孤岛。</p></div></li><li><span>2</span><div><b>预测与行动</b><p>权衡预算、工期与可达人口，选择抢通顺序。</p></div></li><li><span>3</span><div><b>对照与解释</b><p>比较预测与实际，用过程证据解释决策。</p></div></li></ol><div class="lc-model-brief"><b>${esc(s.model.name)}</b><p>${esc(s.model.scope)}</p></div></details></section>`;
+    const settings = `<section class="lc-card"><div class="lc-section-title"><div><h3>本轮条件设置</h3><p>${locked ? '由教学组织者设置，你可以查看。' : '设置预算与雨强；开始后锁定。'}</p></div></div><form id="learning-config"><fieldset ${locked ? 'disabled' : ''}><div class="form-grid"><label class="field lc-full-field">实验情景<select name="scenario">${catalog.scenarios.map(v => `<option value="${esc(v.id)}" ${v.id === config.scenario ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}</select></label><label class="field">预算 / 万元<input name="budget" type="number" min="20" max="200" value="${esc(config.budget)}" required></label><label class="field">降雨 / mm/h<input name="rain" type="number" min="0" max="150" value="${esc(config.rain)}" required></label></div><button type="submit" ${busy ? 'disabled' : ''}>保存本轮条件</button></fieldset></form><p class="hint">切换准备页签会保留输入；开始时保存当前有效条件。</p></section>`;
+    const members = `<section class="lc-card lc-member-card"><div class="lc-section-title">${icon('users')}<div><h3>邀请与分工 · ${s.members.length} 人</h3><p>将实验码 <b>${esc(s.code)}</b> 分享给同伴，选择“加入课堂”。</p></div></div>${membersView(s.members)}<p class="hint">组织者负责设置、推进时间和评阅；学生负责判断与派遣；观察者只读查看。</p></section>`;
+    return `<section class="lc-preparation"><nav class="lc-section-tabs" aria-label="实验准备"><button data-learning-preparation="task" class="${tab === 'task' ? 'is-active' : ''}" aria-pressed="${tab === 'task'}">任务说明</button><button data-learning-preparation="settings" class="${tab === 'settings' ? 'is-active' : ''}" aria-pressed="${tab === 'settings'}">条件设置</button><button data-learning-preparation="members" class="${tab === 'members' ? 'is-active' : ''}" aria-pressed="${tab === 'members'}">成员与分工 <small>${s.members.length}</small></button></nav><div id="lc-preparation-content" tabindex="-1">${tab === 'settings' ? settings : tab === 'members' ? members : task}</div><div class="lc-start"><div><b>${locked ? '等待组织者开始' : '准备好后，进入地图实验'}</b><p>已保存：${esc(scenario?.name || s.config.scenario)} · 预算 ${s.config.budget} 万元 · 降雨 ${s.config.rain} mm/h</p></div><button class="primary" data-learning="start" ${locked || busy ? 'disabled' : ''}>开始实验 ${icon('arrow')}</button></div></section>`;
+  }
+
+
+  function roadPicker(s, selected) {
+    return `<label class="field">定位作业任务<select id="learning-road"><option value="">选择任务编号</option>${s.roads.map(road => `<option value="${esc(road.id)}" ${road.id === selected ? 'selected' : ''}>${esc(road.id)} · ${esc(roadStates[road.status] || road.status)}</option>`).join('')}</select></label>`;
+  }
+
+  function toolHeading(eyebrow, title, text) {
+    return `<div class="lc-tool-heading"><span class="lc-kicker">${eyebrow}</span><h3>${title}</h3><p>${text}</p></div>`;
+  }
+
+  function nextTask(s) {
+    if (s.role === 'observer') return ['events', '跟随小组观察操作与结果', '查看过程记录'];
+    if (!s.state.identification && s.state.time === 0 && s.state.spent === 0) return ['identify', '派遣前，先提交最初的孤岛判断', '进入孤岛识别'];
+    if (!(s.predictions || []).length && s.state.time < 180) return ['predict', '写下未来时刻的可达人口与投入', '记录一次预测'];
+    if (s.nextCompletionAt != null) return ['events', s.role === 'teacher' ? '可用下方快进，观察作业完成后的变化' : '等待组织者推进，观察地图与预测对照', '查看本组操作'];
+    return ['dispatch', '比较受阻通道，安排下一次抢通', '选择道路与队伍'];
+  }
+
+  function observePanel(model) {
+    const { snapshot: s, selected } = model;
+    const node = s.nodes.find(n => n.id === selected);
+    const activeCrews = s.crews.filter(crew => crew.job);
+    const [nextTool, nextText, nextLabel] = nextTask(s);
+    return `${toolHeading('观察 / 建立整体判断', '先读懂这张地图', '绿色表示基地可达，红色表示断连。点选道路后查看抢通条件。')}
+      <div class="lc-observe-metrics"><div><small>基地可达</small><b>${s.stats.available}<em>人</em></b></div><div><small>仍然断连</small><b>${s.stats.isolated}<em>人</em></b></div></div>
+      ${node ? `<div class="lc-selected-node"><span class="lc-status-dot ${node.reachable ? 'is-good' : 'is-danger'}"></span><div><b>${esc(node.name)}</b><p>${node.pop}名教学人口 · ${node.reachable ? '基地可达' : '与基地断连'}</p></div></div>` : ''}
+      ${roadPicker(s, selected)}<div class="lc-next-task"><span>建议下一步</span><b>${nextText}</b><button data-learning-tool="${nextTool}">${nextLabel} ${icon('arrow')}</button></div>
+      <div class="lc-panel-section"><h4>队伍状态 <span>${activeCrews.length} / ${s.crews.length} 作业中</span></h4><ul class="lc-crew-list">${s.crews.map(crew => `<li><span>${esc(crew.name)}</span><b class="${crew.job ? 'is-working' : ''}">${crew.job ? '正在作业' : '待命'}</b></li>`).join('')}</ul></div><p class="hint">人口圈表示教学点位人口；徐州地理为背景，彩色路段为局部教学灾情，蓝色线为已确认的实际进场路径。</p>`;
+  }
+
+  function routePanel(model){
+    const {snapshot:s,routeDraft={from:'S',to:'C'},routeResult,busy}=model;
+    const options=selected=>s.nodes.map(node=>`<option value="${esc(node.id)}" ${node.id===selected?'selected':''}>${esc(node.name)}</option>`).join('');
+    const route=routeResult?.route;
+    return `${toolHeading('真实道路 / 两点查询','从哪里出发，到哪里去？','选择两个地点，按当前封路与限行状态计算道路路径。也可点击地图地点设置终点。')}<form id="learning-route-query"><label class="field">起点<select name="from">${options(routeDraft.from)}</select></label><label class="field">终点<select name="to">${options(routeDraft.to)}</select></label><button class="primary lc-wide" type="submit" ${busy?'disabled':''}>沿真实道路寻路</button></form>${routeResult?route?`<div class="lc-road-preview"><span>服务器确认的可通行路线</span><strong>${route.distanceKm}<small> 公里</small></strong><p>进场教学估计 ${route.minutes} 分钟；地图蓝线沿已收录道路行驶。</p><p>场地至道路接入口：起点 ${route.accessMeters.from} 米、终点 ${route.accessMeters.to} 米，以棕色虚线单独显示。</p><button data-learning="clear-route">清除查询路线</button></div>`:'<div class="lc-inline-notice">当前路况下没有可通行道路路径。请先处理阻断或选择其他地点。</div>':'<p class="hint">道路25km/h、限行减半、场地接入5km/h为教学规则；路况变化后需重新规划。无路时不绘制直线代替。</p>'}`;
+  }
+
+  function nodeNames(s, ids) {
+    return (ids || []).map(id => s.nodes.find(n => n.id === id)?.name || id).join('、') || '无';
+  }
+
+  function identificationFeedback(s, identification, compact = false) {
+    if (identification === undefined) return `<div class="lc-empty-inline"><b>本轮未记录识别反馈</b><p>这份历史报告未保存该项数据。</p></div>`;
+    if (!identification) return `<div class="lc-empty-inline"><b>本轮未提交识别判断</b><p>在派遣和推进前，可先判断初始孤岛。</p></div>`;
+    return `<div class="lc-identify-feedback ${compact ? 'is-compact' : ''}"><div><span>初始孤岛识别反馈</span><strong>${identification.score}<small> / 25</small></strong></div><dl><dt>你的判断</dt><dd>${esc(nodeNames(s, identification.answer))}</dd><dt>模型判定</dt><dd>${esc(nodeNames(s, identification.truth))}</dd></dl><p class="hint">练习反馈单独展示，不计入自动评价85分。</p></div>`;
+  }
+
+  function identifyPanel(model) {
+    const { snapshot: s, busy, identifySelection = [] } = model;
+    const allowed = s.phase === 'running' && s.role !== 'observer' && s.state.time === 0 && s.state.spent === 0;
+    const populations = s.nodes.filter(node => node.pop > 0);
+    return `${toolHeading('判断 / 初始孤岛', '哪些聚落已经断连？', '点选地图中的人口节点，或勾选下方聚落。判断它们是否仍能从基地到达。')}
+      <form id="learning-identify"><fieldset ${!allowed || busy ? 'disabled' : ''}><div class="lc-selection-label"><b>选择与基地断连的聚落</b><span>已选 ${identifySelection.length}</span></div><div class="lc-node-options">${populations.map(node => `<label class="lc-node-option ${identifySelection.includes(node.id) ? 'is-selected' : ''}"><input type="checkbox" name="node" value="${esc(node.id)}" data-learning-identify-node="${esc(node.id)}" ${identifySelection.includes(node.id) ? 'checked' : ''}><span><b>${esc(node.name)}</b><small>${node.pop} 人</small></span></label>`).join('')}</div><button type="submit" class="primary lc-wide" ${!allowed || busy ? 'disabled' : ''}>提交识别判断</button></fieldset></form>
+      ${!allowed ? `<p class="lc-inline-notice">${s.role === 'observer' ? '观察者只读查看小组的识别结果。' : '识别需在派遣和推进前提交，本轮初始判断已锁定。'}</p>` : '<p class="hint">可不选任何聚落；提交后显示与模型判定的对照。</p>'}
+      ${s.state.identification ? identificationFeedback(s, s.state.identification) : '<div class="lc-scoring-note">这是一项25分识别练习反馈，不计入本轮自动85分。</div>'}`;
+  }
+
+  function predictionStatus(prediction) {
+    return ({ verified: '已对照', pending: '等待推演', unfinished: '未到达目标时刻' })[prediction.status] || '等待推演';
+  }
+
+  function predictionCards(predictions) {
+    if (!predictions?.length) return '<div class="lc-empty-inline"><b>本组还没有预测记录</b><p>先写下判断，后续推进到目标时刻即可查看实际结果。</p></div>';
+    return `<ol class="lc-prediction-list">${predictions.slice().reverse().map(p => `<li><div class="lc-prediction-title"><b>T+${p.target} 分钟</b><span class="lc-status-tag ${p.status === 'verified' ? 'is-good' : ''}">${predictionStatus(p)}</span></div><dl><dt>预测</dt><dd>可达 ${p.population} 人 · 投入 ${p.spent} 万元</dd><dt>实际</dt><dd>${p.actual ? `可达 ${p.actual.available} 人 · 投入 ${p.actual.spent} 万元` : p.status === 'unfinished' ? '实验已结束，未到达该时刻。' : '到达目标时刻后显示。'}</dd></dl><p class="lc-reason">${esc(p.reason)}</p></li>`).join('')}</ol>`;
+  }
+
+  function predictPanel(model) {
+    const { snapshot: s, busy, predictionDraft = {} } = model;
+    const allowed = s.role !== 'observer' && s.state.time < 180;
+    const targetInvalid = Number(predictionDraft.target) <= s.state.time || (s.predictions || []).some(p => p.target === Number(predictionDraft.target));
+    return `${toolHeading('预测 / 决策依据', '先写判断，再看结果', '选择一个未来时刻，预测届时的可达人口与累计投入，并说明依据。')}
+      <form id="learning-predict"><fieldset ${!allowed || busy ? 'disabled' : ''}><div class="form-grid"><label class="field">目标时刻 / T+分钟<input name="target" type="number" min="${s.state.time + 1}" max="180" step="1" value="${esc(predictionDraft.target ?? '35')}" required></label><label class="field">预计可达人口 / 人<input name="population" type="number" min="0" max="1520" step="1" value="${esc(predictionDraft.population ?? '')}" placeholder="0–1520" required></label><label class="field lc-full-field">预计累计投入 / 万元<input name="spent" type="number" min="${s.state.spent}" max="${s.config.budget}" step="0.01" value="${esc(predictionDraft.spent ?? '')}" placeholder="${s.state.spent}–${s.config.budget}" required></label><label class="field lc-full-field">判断依据<textarea name="reason" minlength="10" maxlength="1000" rows="3" placeholder="例如：先恢复哪条通道，会连接哪些聚落？" required>${esc(predictionDraft.reason ?? '')}</textarea></label></div><button type="submit" class="primary lc-wide" ${!allowed || busy ? 'disabled' : ''}>保存本次预测</button></fieldset></form>
+      ${allowed && targetInvalid ? '<div class="lc-inline-notice">这个时刻已经过去或已提交预测。<button class="lc-text-button" data-learning="fresh-prediction">准备下一次预测 →</button></div>' : ''}<p class="hint">${s.role === 'observer' ? '观察者可查看小组预测，不可提交。' : `当前T+${s.state.time}分钟，目标时刻须晚于现在。预测用于学习对照，不直接计分。`}</p><div class="lc-panel-section"><h4>本组预测 <span>${s.predictions?.length || 0} 条</span></h4>${predictionCards(s.predictions)}</div>`;
+  }
+
+  function dispatchPanel(model) {
+    const { snapshot: s, selected, busy } = model;
+    const road = s.roads.find(item => item.id === selected);
+    if (!road) return `${toolHeading('行动 / 通道抢通', '选择需要恢复的道路', '点击地图中的道路编号，查看工种、费用、工期与进场条件。')}${roadPicker(s, selected)}<div class="lc-empty-tool">${icon('route')}<b>先选道路，再派遣队伍</b><p>优先考虑能连接更多聚落、且队伍能够到达的通道。</p></div><p class="hint">派遣后产生投入；组织者推进时间，作业完成后再查看连通变化。</p>`;
+    const options = road.dispatchOptions || [];
+    const activeCrew = s.crews.find(crew => crew.job?.edge === road.id);
+    const working = Boolean(activeCrew) || road.status === 'repair';
+    const passable = road.status === 'open' || road.status === 'limited';
+    const hasOptions = options.some(option => option.allowed);
+    const allowed = s.role !== 'observer' && hasOptions;
+    const chosen = options.find(option => option.allowed && option.crewId === model.crewSelection?.[road.id]) || options.find(option => option.allowed);
+    let action;
+    if (working) {
+      action = `<section class="lc-job-progress"><span class="lc-status-tag is-good">已派遣 · 正在作业</span><h4>${activeCrew ? esc(activeCrew.name) + ' / ' + esc(activeCrew.id) : '队伍已在本通道执行作业'}</h4>${activeCrew ? `<p>预计 T+<b>${activeCrew.job.end}</b> 分钟完成${activeCrew.job.end > 180 ? '（本轮推演截止T+180）' : ''}。</p>` : ''}<p>无需重复派遣。${s.role === 'teacher' ? '可使用下方快进查看作业结果。' : '由教学组织者推进时间。'}</p></section>`;
+    } else if (passable) {
+      action = `<section class="lc-job-progress"><span class="lc-status-tag is-good">${road.status === 'limited' ? '限行，仍可通行' : '道路已通行'}</span><h4>无需再次派遣队伍</h4><p>可以选择下一条受阻道路，继续比较抢通优先级。</p></section>`;
+    } else {
+      action = `<form id="learning-dispatch"><label class="field">派出哪支队伍？<select name="crewId" ${s.role === 'observer' || busy ? 'disabled' : ''}>${!hasOptions ? '<option value="" selected disabled>暂无可派遣队伍</option>' : ''}${options.map(option => `<option value="${esc(option.crewId)}" ${chosen?.crewId === option.crewId ? 'selected' : ''} ${option.allowed ? '' : 'disabled'}>${esc(s.crews.find(crew => crew.id === option.crewId)?.name || option.crewId)}${option.allowed ? '' : ' · ' + esc(option.reason)}</option>`).join('')}</select></label>${chosen?.completionAt != null ? `<div class="lc-road-preview"><span>当前路况下的作业估计</span>${chosen.travelDistanceKm!=null?`<p>沿真实道路进场 ${chosen.travelDistanceKm} 公里；终点位于作业区外围。</p>`:""}<strong>T+${chosen.completionAt}<small> 分钟完成</small></strong><p>进场 ${chosen.travelMinutes} 分钟 + 作业 ${Number(chosen.workMinutes).toFixed(1).replace(/\.0$/, '')} 分钟，总计约 ${chosen.duration} 分钟。</p><p>派遣后剩余预算 ${Number((s.config.budget - s.state.spent - road.cost).toFixed(2))} 万元${chosen.completionAt > 180 ? '；预计超出本轮180分钟时限' : ''}。</p></div>` : ''}<input type="hidden" name="edgeId" value="${esc(road.id)}"><button type="submit" class="primary lc-wide" ${busy || !allowed ? 'disabled' : ''}>确认派遣 · ${road.cost}万元</button></form>${s.role === 'observer' ? '<p class="lc-inline-notice">观察者只能查看，不能派遣。</p>' : !hasOptions ? '<p class="lc-inline-notice">当前没有可派遣队伍，请检查工种、进场道路与剩余预算。</p>' : '<p class="hint">实际派遣以最新路况、队伍与预算校验为准；由组织者推进仿真。</p>'}`;
+    }
+    return `${toolHeading('行动 / 通道抢通', `道路 ${esc(road.id)}`, `${esc(s.nodes.find(n => n.id === road.a)?.name)} → ${esc(s.nodes.find(n => n.id === road.b)?.name)}`)}${roadPicker(s, selected)}
+      <div class="lc-road-status"><span class="lc-status-dot ${road.status === 'open' ? 'is-good' : road.status === 'repair' ? 'is-working' : 'is-danger'}"></span><b>${esc(roadStates[road.status] || road.status)}</b><small>当前路况</small></div><div class="lc-road-stats"><span>抢通费用<b>${road.cost}<em>万元</em></b></span><span>基准工作量<b>${road.work}<em>分钟</em></b></span><span>需要工种<b>${esc(types[road.requiredType] || road.requiredType)}</b></span><span>当前积水<b>${Number(road.depth).toFixed(2)}<em>米</em></b></span></div>
+      ${action}<button class="lc-text-button" data-learning="unselect">关闭对象信息</button>`;
+  }
+
+  function eventsList(events) {
+    if (!events?.length) return '<div class="lc-empty-inline"><b>等待第一条课堂操作</b><p>开始、识别、预测、派遣和推进都会留下记录。</p></div>';
+    return `<ol class="lc-event-list">${events.slice().reverse().map(event => `<li><span class="lc-event-time">T+${event.time ?? event.at ?? 0}<small>分钟</small></span><div><b>${esc(event.actorName || '课堂系统')}</b><p>${esc(event.text || event.action || event.type || '操作已保存')}</p></div></li>`).join('')}</ol>`;
+  }
+
+  function eventsPanel(model) {
+    return `${toolHeading('记录 / 小组过程', '回看每一步决策', '这里记录同一实验中各成员的操作，帮助你在复盘时解释顺序与取舍。')}${eventsList(model.snapshot.events)}`;
+  }
+
+  function topology(model) {
+    const { snapshot: s, identifySelection = [], tool = 'observe' } = model;
+    const masking = tool === 'identify' && !s.state.identification;
+    const roads = s.roads.map(road => {
+      const a = s.nodes.find(node => node.id === road.a), b = s.nodes.find(node => node.id === road.b);
+      const color = ({ blocked: '#df7c83', repair: '#82afe6', limited: '#d1b074', open: '#70bca6' })[road.status];
+      return `<g role="button" tabindex="0" data-learning-road="${esc(road.id)}" aria-label="选择道路${esc(road.id)}"><line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${color}" stroke-width="8"/><text x="${(a.x + b.x) / 2}" y="${(a.y + b.y) / 2 - 8}">${esc(road.id)}</text></g>`;
+    }).join('');
+    const nodes = s.nodes.map(node => `<g class="${identifySelection.includes(node.id) ? 'lc-node-selected' : ''}" ${node.pop > 0 ? `role="button" tabindex="0" data-learning-node="${esc(node.id)}" aria-label="${tool === 'identify' ? '选择聚落' : '查看'}${esc(node.name)}"` : ''}><circle cx="${node.x}" cy="${node.y}" r="${node.pop > 0 ? 15 : 12}" fill="${masking ? '#8ba8bb' : node.reachable ? '#70bca6' : '#df7c83'}"/><text x="${node.x}" y="${node.y - 23}">${esc(node.name)}</text></g>`).join('');
+    return `<details class="lc-topology"><summary>地图无法加载？查看可操作的教学拓扑</summary><svg viewBox="0 0 900 500" role="img" aria-label="本轮教学路网">${roads}${nodes}</svg></details>`;
+  }
+
+  function experiment(model) {
+    const { snapshot: s, layers, busy, sceneHTML, tool = 'observe', panelOpen, layersOpen } = model;
+    const toolPanels = { route: routePanel, observe: observePanel, identify: identifyPanel, predict: predictPanel, dispatch: dispatchPanel, events: eventsPanel };
+    const renderTool = toolPanels[tool] || observePanel;
+    const canControlTime = s.role === 'teacher' && !busy;
+    const identifying = panelOpen && tool === 'identify' && !s.state.identification;
+    return `<section class="lc-experiment"><div class="lc-running-head"><p><b>本轮任务</b> 先判断、再决策，用结果解释你的选择。</p><div class="lc-live-stats"><span>仿真 <b>T+${s.state.time}</b> 分钟</span><span>可达 <b>${s.stats.available}</b> 人</span><span>剩余 <b>${s.config.budget - s.state.spent}</b> 万元</span></div></div>
+      <div class="lc-map-work ${panelOpen ? 'has-tool-panel' : 'is-map-only'} ${tool === 'predict' || tool === 'events' ? 'lc-panel-first-mobile' : ''}"><nav class="lc-tool-rail" aria-label="实验工具">${tools.map(([id, title, subtitle, symbol]) => `<button data-learning-tool="${id}" class="${panelOpen && tool === id ? 'is-active' : ''}" aria-pressed="${Boolean(panelOpen && tool === id)}" title="${subtitle}">${icon(symbol)}<span>${title}</span><small>${subtitle}</small></button>`).join('')}<div class="lc-rail-note">条件已锁定<br>围绕地图做决策</div></nav>
+      <section class="lc-map-column" aria-label="课堂实验地图"><div class="lc-layer-bar"><button data-learning="layers" aria-expanded="${Boolean(layersOpen)}">${icon('map')} 图层</button><span class="lc-map-instruction">云龙湖及周边城区 · 虚线为教学任务范围</span>${identifying ? '<span class="lc-map-key is-neutral"><i></i>沿道路判断连通</span>' : '<span class="lc-map-key"><i></i>可达 <i></i>断连</span>'}${layersOpen ? `<div class="lc-layer-popover"><div><b>空间信息图层</b><button data-learning="layers" aria-label="关闭图层">×</button></div>${[['people', '人口'], ['roads', '教学道路'], ['floods', '教学积水'], ['buildings', '建筑']].map(([id, label]) => `<label><input type="checkbox" data-learning-layer="${id}" ${layers[id] ? 'checked' : ''}>${label}</label>`).join('')}<p>人口、积水与彩色通道为教学设定。</p></div>` : ''}</div>${sceneHTML}${topology(model)}</section>
+      ${panelOpen ? `<aside class="lc-tool-panel" aria-label="${esc(tools.find(item => item[0] === tool)?.[1] || '观察地图')}" data-learning-current-tool="${esc(tool)}"><div class="lc-panel-toolbar"><span>当前操作</span><button data-learning="close-panel" aria-label="收起操作面板">收起 ×</button></div>${renderTool(model)}</aside>` : ''}</div>
+      <div class="lc-time-controls"><div class="lc-time-summary"><span class="lc-clock-label">仿真时钟</span><b>T+${s.state.time}<small> / ${s.config.horizon || 180} 分钟</small></b><span>${s.nextCompletionAt != null ? `作业预计 T+${s.nextCompletionAt} 完成${s.nextCompletionAt > 180 ? '（本轮截止180）' : ''}` : '暂无正在执行的作业'}</span></div><div class="lc-time-actions"><button data-learning="advance" ${canControlTime ? '' : 'disabled'}>推进5分钟</button><button data-learning="advance-next" ${canControlTime && s.nextCompletionAt != null ? '' : 'disabled'}>快进到作业完成</button><button class="lc-finish-button" data-learning="finish" ${canControlTime ? '' : 'disabled'}>结束并生成报告</button></div></div>
+      <p class="lc-model-note">${esc(s.model.name)} · 人口、灾情与作业参数为教学设定。${s.role !== 'teacher' ? '由教学组织者推进时间。' : ''}</p></section>`;
+  }
+
+  function predictionTable(predictions) {
+    if (!predictions?.length) return '<div class="lc-empty-inline"><b>本轮没有提交预测</b><p>下一轮可在派遣前记录判断，再用仿真结果验证。</p></div>';
+    return `<div class="lc-table-scroll"><table class="lc-prediction-table"><thead><tr><th>目标时刻</th><th>预测可达 / 实际</th><th>预测投入 / 实际</th><th>对照状态</th></tr></thead><tbody>${predictions.map(p => `<tr><td><b>T+${p.target}</b><details><summary>查看预测依据</summary><small>${esc(p.reason)}</small></details></td><td>${p.population} 人 <span>/ ${p.actual ? p.actual.available + ' 人' : '—'}</span></td><td>${p.spent} 万元 <span>/ ${p.actual ? p.actual.spent + ' 万元' : '—'}</span></td><td><span class="lc-status-tag ${p.status === 'verified' ? 'is-good' : ''}">${predictionStatus(p)}</span></td></tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function recoveryChart(r) {
+    const timeline = (r.timeline || []).filter(point => Number.isFinite(point.time) && Number.isFinite(point.available) && Number.isFinite(point.spent));
+    if (!timeline.length) return '';
+    const points = r.baseline ? [{ time: 0, ...r.baseline }, ...timeline] : timeline;
+    if ((r.time ?? points.at(-1).time) === 0) return '<section class="lc-card lc-recovery"><h3>连通恢复过程</h3><p class="hint">本轮在T+0结束，尚无时间推进记录；不绘制恢复曲线。</p></section>';
+    const xmax = Math.max(1, r.time ?? points.at(-1).time);
+    const ymax = Math.max(1, r.stats.pop || 1520);
+    const x = point => +(52 + point.time / xmax * 810).toFixed(2);
+    const y = point => +(174 - point.available / ymax * 136).toFixed(2);
+    const line = points.map((point, i) => i ? `H${x(point)}V${y(point)}` : `M${x(point)},${y(point)}`).join('');
+    const changes = points.filter((point, i) => !i || point.available !== points[i - 1].available || point.spent !== points[i - 1].spent || i === points.length - 1);
+    return `<section class="lc-card lc-recovery"><div class="lc-section-title">${icon('route')}<div><h3>连通恢复过程</h3><p>把每次行动放回时间线上，观察可达人口何时发生变化。</p></div><span class="lc-chart-legend"><i></i>实际可达人口</span></div><svg class="lc-recovery-chart" viewBox="0 0 900 216" role="img" aria-label="本轮实际可达人口随仿真时间变化，开始${points[0].available}人，结束${points.at(-1).available}人"><line x1="52" y1="38" x2="862" y2="38" class="lc-chart-grid"/><line x1="52" y1="106" x2="862" y2="106" class="lc-chart-grid"/><line x1="52" y1="174" x2="862" y2="174" class="lc-chart-grid"/><text x="42" y="42" text-anchor="end">${ymax}</text><text x="42" y="110" text-anchor="end">${Math.round(ymax / 2)}</text><text x="42" y="178" text-anchor="end">0</text><path d="${line}" fill="none" class="lc-chart-line"/><circle cx="${x(points.at(-1))}" cy="${y(points.at(-1))}" r="4" class="lc-chart-end"/><text x="52" y="202">T+0</text><text x="862" y="202" text-anchor="end">T+${xmax} 分钟</text></svg><details class="lc-change-details"><summary>查看关键时刻的人口与投入</summary><div class="lc-table-scroll"><table class="lc-prediction-table"><thead><tr><th>仿真时刻</th><th>实际可达人口</th><th>累计投入</th></tr></thead><tbody>${changes.map(point => `<tr><td>T+${point.time} 分钟</td><td>${point.available} 人</td><td>${point.spent} 万元</td></tr>`).join('')}</tbody></table></div></details><p class="hint">曲线来自已保存的逐分钟实验记录；虚拟人口连通变化不等同于实际人员救援数量。</p></section>`;
+  }
+
+  function reviewView(model) {
+    const { report: r, snapshot: s, busy, reviewDraft = {}, exporting } = model;
+    if (r.score.scoringVersion !== 2 || !Number.isFinite(r.score.autoScore)) return '<section class="lc-card lc-teacher-review"><h3>历史评阅记录</h3><p class="hint">本轮采用旧评分格式，保留原成绩，不追加新版15分评阅。</p></section>';
+    const review = r.review;
+    const completed = r.score.manualPending === false && r.score.manualScore != null;
+    const rubric = [['evidence', '数据依据', '结合路况、人口与预测解释判断。'], ['analysis', '权衡分析', '说明预算、工期与抢通顺序的取舍。'], ['improvement', '反思改进', '根据结果提出具体的改进方案。']];
+    return `<section class="lc-card lc-teacher-review"><div class="lc-section-title">${icon('users')}<div><h3>决策解释与教师评阅</h3><p>自动指标评价决策成效，教师结合本组解释与过程进行点评。</p></div></div><div class="lc-report-total"><div><b>${completed ? '本轮总评已完成' : '等待教学组织者评阅'}</b><p>自动评价 ${Number(r.score.autoScore ?? 0).toFixed(1)} / 85 · 人工评阅 ${completed ? Number(r.score.manualScore).toFixed(1) : '待评'} / 15</p></div><strong>${completed ? Number(r.score.total).toFixed(1) + '<small> / 100</small>' : '<small>人工部分待评</small>'}</strong></div>${review ? `<div class="lc-review-state"><b>${esc(review.reviewer)} 的评语</b><p>${esc(review.comment)}</p><small>${rubric.map(([key, label]) => `${label} ${review.ratings[key]} / 5`).join(' · ')} · 第${review.revision}次评阅</small></div>` : `<p class="hint">${completed ? '这份历史记录未保存评语详情。' : '尚未提交人工评分；当前自动85分单独呈现。'}</p>`}${s.role === 'teacher' && !exporting ? `<form id="learning-review" class="lc-review-form"><h4>${review ? '修订本轮评阅' : '为本组提交评阅'}</h4><p>每项0–5分，合计15分；评语说明判断依据与改进建议。</p><div class="lc-review-rubric">${rubric.map(([key, label, description]) => `<label class="field"><span>${label}<small>${description}</small></span><select name="${key}" required ${busy ? 'disabled' : ''}><option value="">选择分数</option>${[0, 1, 2, 3, 4, 5].map(value => `<option value="${value}" ${String(reviewDraft[key]) === String(value) ? 'selected' : ''}>${value} / 5</option>`).join('')}</select></label>`).join('')}</div><label class="field">评语与改进建议<textarea name="comment" minlength="10" maxlength="2000" rows="3" placeholder="请结合预测、派遣顺序和实际结果，给出具体反馈。" required ${busy ? 'disabled' : ''}>${esc(reviewDraft.comment || '')}</textarea></label><div class="lc-form-footer"><span class="hint">保存后组内成员会看到最新评阅；不会重算已保存的自动成绩。</span><button type="submit" class="primary" ${busy ? 'disabled' : ''}>${review ? '保存修订' : '提交教师评阅'}</button></div></form>` : ''}</section>`;
+  }
+
+  function reportView(model) {
+    const { report: r, snapshot: s, exporting } = model;
+    if (!r) return `<section class="lc-empty"><h2>本轮实验已结束</h2><p>正在读取已保存的本轮报告。</p><button data-learning="report">读取报告</button></section>`;
+    const rows = (r.score.rows || []).filter(row => (row.key || row.id) !== 'reasoning');
+    const tab = model.reportTab || 'summary';
+    const show = id => exporting || tab === id;
+    const tabs = [['summary', '结果总览'], ['comparison', '判断对照'], ['process', '过程记录'], ['review', s.role === 'teacher' ? '教师评阅' : '评阅反馈']];
+    return `<section class="lc-report"><div class="lc-report-title"><div><span class="lc-kicker">本轮结果 / ${esc(s.code)}</span><h2>实验报告</h2><p>${esc(s.title)} · 仿真至T+${s.state.time}分钟</p></div><button class="primary" data-learning="export">导出完整报告</button></div>
+      ${!exporting ? `<nav class="lc-section-tabs" aria-label="报告内容">${tabs.map(([id, label]) => `<button data-learning-report-tab="${id}" class="${tab === id ? 'is-active' : ''}" aria-pressed="${tab === id}">${label}${id === 'review' && r.score.manualPending !== false ? '<small>待评</small>' : ''}</button>`).join('')}</nav>` : ''}<div id="lc-report-content" tabindex="-1">
+      ${show('summary') ? `<div class="lc-report-metrics"><div><small>最终可达人口</small><strong>${r.stats.available}<em>人</em></strong>${r.baseline ? `<span>初始 ${r.baseline.available} 人</span>` : '<span>初始数据：本轮未记录</span>'}</div><div><small>仍然断连</small><strong>${r.stats.isolated}<em>人</em></strong>${r.baseline ? `<span>初始 ${r.baseline.isolated} 人</span>` : '<span>初始数据：本轮未记录</span>'}</div><div><small>实际投入</small><strong>${r.spent ?? s.state.spent}<em>万元</em></strong><span>预算 ${s.config.budget} 万元</span></div><div><small>${Number.isFinite(r.score.autoScore) ? '自动评价' : '历史记录成绩'}</small><strong>${Number.isFinite(r.score.autoScore) ? Number(r.score.autoScore).toFixed(1) + '<em> / 85</em>' : esc(r.score.total ?? '未记录')}</strong><span>${!Number.isFinite(r.score.autoScore) ? '旧格式保留' : r.score.manualPending === false ? '人工评阅已完成，可查看评阅反馈' : '人工评阅15分，尚未提交'}</span></div></div>${recoveryChart(r)}<section class="lc-card"><div class="lc-section-title"><div><h3>自动评价依据</h3><p>评价来自本轮保存的状态与过程。</p></div></div>${rows.map(row => `<div class="lc-score-row"><b>${esc(row.name || row.label || row.title || '评价分项')}</b><span>${row.score == null ? '待点评' : row.score} / ${row.max ?? row.full ?? '—'}</span><details><summary>查看评价依据</summary><p>${esc(row.reason || '本项暂无说明。')}</p></details></div>`).join('')}<p class="hint">自动部分满分85分；识别练习反馈单独展示。</p></section>` : ''}
+      ${show('comparison') ? `<section class="lc-card lc-learning-review"><div class="lc-section-title">${icon('chart')}<div><h3>学习判断对照</h3><p>识别反馈和预测对照独立展示，帮助解释决策，不重复计入自动评分。</p></div></div><div class="lc-learning-comparison"><section><h4>最初，你如何判断孤岛？</h4>${identificationFeedback(s, r.identification, true)}</section><section><h4>推演前的预测，与实际一致吗？</h4>${predictionTable(r.predictions)}</section></div></section>` : ''}
+      ${show('process') ? `<section class="lc-card"><div class="lc-section-title">${icon('list')}<div><h3>本轮过程记录</h3><p>查看成员分工、操作顺序与结果变化。</p></div></div>${eventsList(r.events)}<p class="hint">提前结束会保留未完成作业，不因快速结束获得完成奖励。</p></section>` : ''}
+      ${show('review') ? reviewView(model) : ''}</div><div class="lc-report-footer"><span>报告与实验操作分开；导出始终包含所有报告内容。</span><button data-learning="disconnect">返回课堂入口 ${icon('arrow')}</button></div></section>`;
+  }
+
+
+  function explanation(model) {
+    const role = model.snapshot?.role;
+    const guidance = role === 'observer' ? '你是观察者，可以查看地图、过程与报告；实验操作由小组其他成员完成。' : role === 'student' ? '你是学生，可以识别、预测和派遣；由教学组织者推进时间与结束实验。' : '教学组织者负责设置条件、邀请成员、推进时间与结束后的人工评阅；也可以独立完成一轮练习。';
+    const layers = [
+      ['前端界面', 'controller管理状态和按钮；views只按状态显示；api只发送请求。', 'frontend/classroom/controller.js · views.js · api.js'],
+      ['通信接口', '识别教学会话、接收操作，并转交业务层。', 'backend/http/learning-routes.cjs'],
+      ['业务处理', '检查权限、预算与进场，调用共享教学规则。', 'backend/application/learning-service.cjs + shared/engine.js'],
+      ['数据保存', '写入成功才返回最新状态，报告读取这份记录。', 'backend/persistence/learning-store.cjs']
+    ];
+    return `<section class="lc-explain lc-card"><div class="lc-section-title"><div><h3>一轮实验，怎样完成？</h3><p>${guidance}</p></div><button data-learning="explain">收起指南</button></div><div class="lc-guide-card"><b>观察地图 → 提交判断 → 行动验证 → 对照复盘</b><p>左侧选择工具或直接点选地图对象，按需打开操作面板；收起后继续观察地图。点击道路编号可查看费用与作业条件；滚轮拉近、右键拖动可观察建筑。</p><p>“两点寻路”先选起点与终点，蓝线为当前可行道路，棕色虚线是场地接入。初始孤岛判断须在派遣和推进前提交。预测须选未来时刻；作业完成后可用实际结果检验。返回入口仍会保留本浏览器中的恢复身份。</p></div><ol class="lc-task-sequence"><li><span>1</span><div><b>设置：先明确本轮条件</b><p>创建实验，设置预算与雨强；同伴输入六位实验码加入，组织者开始实验。</p></div></li><li><span>2</span><div><b>实验：用地图完成判断与行动</b><p>提交孤岛识别，写下预测；点选受阻道路，比较工种、费用与预计完成时刻，再派遣队伍。组织者推进或快进仿真。</p></div></li><li><span>3</span><div><b>报告：把判断和结果放在一起</b><p>结束后查看人口变化、预测对照和自动85分；组织者结合决策解释进行15分人工评阅，组内同步查看并可导出报告。</p></div></li></ol><details class="lc-architecture-details"><summary>想了解实现原理？跟着一次派遣看懂分层架构</summary><div class="lc-flow">${layers.map(([title, text, file], index) => `<div><span>0${index + 1}</span><b>${title}</b><p>${text}</p><code>${file}</code></div>`).join('')}</div>
+      <p>后端由 <code>backend/server.cjs</code> 组装接口、业务与存储。前端把明确的页面模型传给views，把令牌传给api；业务层不依赖网页。各层可在一个Node.js进程中运行。</p><h4>自己验证一次</h4><p>开始实验 → 提交初始孤岛判断 → 选择未来时刻并预测 → R3 / P1派遣 → 按后端估计快进至作业完成 → 查看原预测与实际对照 → 结束查看报告。</p><p class="hint">本工作区已接入真实道路两点查询、设置、识别、预测、派遣、推进和报告；独立实景实验等旧模块仍保留。实名账号、正式数据库和远程托管尚未建设。</p><details><summary>查看最近请求（不显示会话令牌）</summary><ol class="lc-traces">${(model.traces || []).map(trace => `<li><b>${esc(trace.method)}</b> <code>${esc(trace.path)}</code> · ${esc(trace.status)} · ${trace.ms}ms${trace.version !== undefined ? ' · 版本' + trace.version : ''}<small>提交字段：${esc(trace.fields.join('、') || '无')}；状态：${esc(trace.phase || '—')}</small></li>`).join('')}</ol></details></details></section>`;
+  }
+
+  function view(model) {
+    const { catalog, online, snapshot, busy, error, notice, explain } = model;
+    let content;
+    if (!catalog) content = online === false ? offlineView() : loadingView();
+    else if (!snapshot) content = introduction(model);
+    else if (snapshot.phase === 'draft') content = preparation(model);
+    else if (snapshot.phase === 'running') content = experiment(model);
+    else content = reportView(model);
+    return `<div class="learning-shell ${snapshot?.phase === 'running' ? 'is-experiment' : ''} ${model.panelOpen && model.tool === 'identify' && !snapshot?.state?.identification ? 'lc-identifying' : ''}" data-version="${snapshot?.version || 0}" aria-busy="${Boolean(busy)}">${header(model)}${snapshot?.phase==="running"&&!snapshot.state.routingModel?`<div class="lc-legacy-model"><span>本轮为旧拓扑教学模型，保留原进度与成绩。新建课堂可使用真实道路计算。</span><button data-learning="new-road-classroom">新建真实道路课堂</button></div>`:""}${error ? `<div class="lc-error" role="alert">${esc(error)}</div>` : ''}${notice ? `<div class="lc-notice" role="status">${icon('check')}${esc(notice)}</div>` : ''}${explain ? explanation(model) : ''}${content}</div>`;
+  }
+
+  return Object.freeze({ view, renderReport: reportView });
+})();
+
+;
+/* Source: frontend/classroom/controller.js */
+/*
+ * 课堂前端 / 交互控制层
+ * 这里是课堂页面状态的唯一拥有者：响应按钮 → 调用 API → 接收后端快照 → 刷新显示。
+ * API 负责通信，views 负责 HTML；规则和成绩由后端确定。
+ */
+window.FloodLearningUI = (() => {
+  'use strict';
+
+  const storageKey = 'flood-classroom-session-v1';
+  const historyKey = 'flood-classroom-history-v1';
+  const api = window.FloodClassroomAPI.createClient();
+  const views = window.FloodClassroomViews;
+  const model = {
+    snapshot: null,
+    catalog: null,
+    report: null,
+    online: null,
+    busy: false,
+    error: '',
+    notice: '',
+    selected: null,
+    tool: 'observe',
+    panelOpen: false,
+    layersOpen: false,
+    mapScope: 'region',
+    routeDraft: {from:'S',to:'C'},
+    routeResult: null,
+    entry: '',
+    preparation: 'task',
+    reportTab: 'summary',
+    createDraft: { name: '课堂演示', title: '通道恢复基础实验', scenario: 'basic', budget: '80', rain: '45' },
+    joinDraft: { code: '', name: '', role: 'student' },
+    configDraft: {},
+    identifySelection: [],
+    predictionDraft: { target: '35', population: '', spent: '', reason: '' },
+    reviewDraft: { evidence: '', analysis: '', improvement: '', comment: '' },
+    crewSelection: {},
+    recentSessions: [],
+    explain: false,
+    traces: [],
+    layers: { people: true, roads: true, floods: true, buildings: true }
+  };
+  let credential = null;
+  let loading = false;
+  let poll = null;
+  let mapTimer = null;
+  let selectionMap = null;
+  let waitingMap = null;
+  let mapFrame = '';
+  let resizeTimer = null;
+  let identifyDirty = false;
+  let disconnected = false;
+  let reportFailure = false;
+  let reviewDirty = false;
+  let savedSessions = [];
+  let configDirty = false;
+  let noticeTimer = null;
+  let lastNotice = '';
+
+  // 凭据只保存在本机，不传给显示层，也不写入请求记录。
+  try {
+    credential = JSON.parse(localStorage.getItem(storageKey) || 'null');
+  } catch {
+    credential = null;
+  }
+  try {
+    const saved = JSON.parse(localStorage.getItem(historyKey) || '[]');
+    savedSessions = Array.isArray(saved) ? saved.filter(item => /^\d{6}$/.test(item?.code) && /^[A-Za-z0-9_-]{43}$/.test(item?.token)).slice(0, 8) : [];
+  } catch { savedSessions = []; }
+  updateRecentSessions();
+
+  // 视图只接收名称、阶段和实验码；恢复凭据仍留在控制层。
+  function updateRecentSessions() {
+    model.recentSessions = savedSessions.map(({ code, title, role, phase }) => ({ code, title, role, phase }));
+  }
+
+  function retainSession(snapshot) {
+    if (!credential || credential.code !== snapshot?.code) return;
+    const item = { ...credential, title: snapshot.title, role: snapshot.role, phase: snapshot.phase };
+    savedSessions = [item, ...savedSessions.filter(previous => previous.code !== item.code)].slice(0, 8);
+    updateRecentSessions();
+    try { localStorage.setItem(historyKey, JSON.stringify(savedSessions)); } catch {
+      model.error = '浏览器无法保存恢复入口；请暂时保留当前页面。';
+    }
+  }
+
+  function active() {
+    return document.body.dataset.page === 'classroom';
+  }
+
+  function redraw() {
+    if (active()) window.render();
+    if (model.notice !== lastNotice) {
+      clearTimeout(noticeTimer);
+      lastNotice = model.notice;
+      if (lastNotice) noticeTimer = setTimeout(() => {
+        model.notice = '';
+        lastNotice = '';
+        // 移除短提示即可，不重绘地图和正在输入的表单。
+        document.querySelector('.learning-shell>.lc-notice')?.remove();
+      }, 5000);
+    }
+  }
+
+  function rememberCredential() {
+    try {
+      if (credential) localStorage.setItem(storageKey, JSON.stringify(credential));
+      else localStorage.removeItem(storageKey);
+    } catch {
+      model.error = '浏览器无法保存连接信息，请记下实验码。';
+    }
+  }
+
+  function recordTrace(trace) {
+    model.traces.unshift(trace);
+    model.traces.length = Math.min(model.traces.length, 6);
+  }
+
+  // controller 显式传令牌给 API，只把服务结果放入页面模型。
+  async function request(path, method = 'GET', body, quiet = false) {
+    try {
+      const result = await api.request({ path, method, body, token: credential?.token });
+      model.online = true;
+      if (!quiet) recordTrace(result.trace);
+      return result.data;
+    } catch (error) {
+      if (error.serviceUnavailable) model.online = false;
+      if (!quiet && error.trace) recordTrace(error.trace);
+      throw error;
+    }
+  }
+
+  // 多人同步中可能较晚收到旧响应，不能用它覆盖更新的版本。
+  function adopt(snapshot) {
+    const current = model.snapshot;
+    if (current && snapshot.code === current.code && snapshot.version < current.version) return;
+    // 创建 / 加入响应包含 token，页面模型只接收去掉 token 的实验投影。
+    const { token, ...projection } = snapshot;
+    if(current&&current.version!==projection.version)model.routeResult=null;
+    model.snapshot = projection;
+    if (!current || current.code !== projection.code) {
+      resetWorkspace(projection);
+    } else if (!identifyDirty && projection.state.identification) {
+      model.identifySelection = [...projection.state.identification.answer];
+    }
+    if (projection.phase === 'draft' && !configDirty) model.configDraft = { ...projection.config };
+    if (current && current.phase !== projection.phase) {
+      model.panelOpen = false;
+      model.layersOpen = false;
+      model.reportTab = 'summary';
+    }
+    if (projection.phase === 'finished' && projection.report) {
+      // 报告随会话版本同步，避免同学一直看到老师评阅前的缓存。
+      model.report = projection.report;
+      if (!reviewDirty) {
+        const review = projection.review || projection.report.review;
+        model.reviewDraft = { evidence: review?.ratings.evidence ?? '', analysis: review?.ratings.analysis ?? '', improvement: review?.ratings.improvement ?? '', comment: review?.comment || '' };
+      }
+    }
+    if (!current || current.version !== projection.version || current.code !== projection.code) retainSession(projection);
+  }
+
+  // 这些是页面草稿，不会直接修改后端实验或参与评分。
+  function resetWorkspace(snapshot) {
+    model.tool = 'observe';
+    model.panelOpen = false;
+    model.layersOpen = false;
+    model.mapScope = 'region';
+    model.routeDraft = {from:'S',to:'C'};
+    model.routeResult = null;
+    model.entry = '';
+    model.preparation = 'task';
+    model.reportTab = 'summary';
+    configDirty = false;
+    model.configDraft = { ...(snapshot?.config || {}) };
+    model.notice = '';
+    identifyDirty = false;
+    disconnected = false;
+    reportFailure = false;
+    reviewDirty = false;
+    model.crewSelection = {};
+    model.identifySelection = [...(snapshot?.state.identification?.answer || [])];
+    model.predictionDraft = {
+      target: String(Math.min(180, (snapshot?.state.time || 0) + 35)),
+      population: '', spent: String(snapshot?.state.spent || 0), reason: ''
+    };
+    model.reviewDraft = { evidence: '', analysis: '', improvement: '', comment: '' };
+  }
+
+  function freshPrediction() {
+    const snapshot = model.snapshot;
+    const used = new Set((snapshot.predictions || []).map(value => value.target));
+    let target = Math.min(snapshot.config.horizon || 180, snapshot.state.time + 35);
+    while (used.has(target) && target < 180) target++;
+    if (used.has(target)) target = Array.from({ length: Math.max(0, 180 - snapshot.state.time) }, (_, i) => snapshot.state.time + i + 1).find(at => !used.has(at)) ?? '';
+    model.predictionDraft = { target: String(target), population: '', spent: String(snapshot.state.spent), reason: '' };
+  }
+
+  async function resumeSession(code) {
+    const saved = savedSessions.find(item => item.code === code);
+    if (!saved || model.busy) return;
+    credential = { code: saved.code, token: saved.token };
+    model.busy = true;
+    model.error = '';
+    redraw();
+    try {
+      const snapshot = await request('/sessions/' + saved.code);
+      model.report = null;
+      adopt(snapshot);
+      rememberCredential();
+      model.notice = '已恢复原课堂身份，可以继续实验或查看报告。';
+    } catch (error) {
+      credential = null;
+      rememberCredential();
+      model.error = error.message;
+      if (['unauthorized', 'not_found'].includes(error.code)) {
+        savedSessions = savedSessions.filter(item => item.code !== code);
+        updateRecentSessions();
+        try { localStorage.setItem(historyKey, JSON.stringify(savedSessions)); } catch {}
+      }
+    } finally { model.busy = false; redraw(); }
+  }
+
+  function canIdentify() {
+    const snapshot = model.snapshot;
+    return snapshot?.phase === 'running' && snapshot.role !== 'observer' &&
+      snapshot.state.time === 0 && snapshot.state.spent === 0 && !model.busy;
+  }
+
+  function chooseNode(id) {
+    const node = model.snapshot?.nodes.find(node => node.id === id);
+    if (!node) return;
+    model.selected = id;
+    if (!model.panelOpen) model.tool = 'observe';
+    model.panelOpen = true;
+    if(model.tool==='route'){model.routeDraft.to=id;model.routeResult=null;}
+    else if (model.tool !== 'identify') model.tool = 'observe';
+    if (model.tool === 'identify' && node.pop > 0 && canIdentify()) {
+      const selected = new Set(model.identifySelection);
+      selected.has(id) ? selected.delete(id) : selected.add(id);
+      model.identifySelection = [...selected];
+      identifyDirty = true;
+    }
+    redraw();
+  }
+
+  function chooseRoad(id) {
+    model.selected = id;
+    model.tool = 'dispatch';
+    model.panelOpen = true;
+    redraw();
+  }
+
+  async function refresh(silent = false) {
+    if (!credential) return;
+    const previousOnline = model.online;
+    try {
+      const snapshot = await request('/sessions/' + credential.code, 'GET', undefined, silent);
+      const changed = !model.snapshot || snapshot.version !== model.snapshot.version;
+      adopt(snapshot);
+      if (disconnected) {
+        model.error = '';
+        model.notice = '课堂连接已恢复，数据已重新同步。';
+        disconnected = false;
+      }
+      if (changed || previousOnline !== model.online || !silent) redraw();
+    } catch (error) {
+      if (!silent || previousOnline !== model.online) {
+        model.error = error.message;
+        if (error.serviceUnavailable) disconnected = true;
+        redraw();
+      }
+    }
+  }
+
+  async function connect(form, join = false) {
+    if (model.busy) return;
+    const values = Object.fromEntries(new FormData(form));
+    if (!join) {
+      values.rain = Number(values.rain);
+      values.budget = Number(values.budget);
+    }
+    model.busy = true;
+    model.error = '';
+    model.notice = '';
+    redraw();
+    try {
+      const snapshot = await request(join ? '/join' : '/sessions', 'POST', values);
+      credential = { code: snapshot.code, token: snapshot.token };
+      rememberCredential();
+      adopt(snapshot);
+      model.report = null;
+      model.selected = null;
+    } catch (error) {
+      model.error = error.message;
+    } finally {
+      model.busy = false;
+      redraw();
+    }
+  }
+
+  async function command(type, values = {}) {
+    if (model.busy || !model.snapshot) return false;
+    let succeeded = false;
+    model.busy = true;
+    model.error = '';
+    model.notice = '';
+    redraw();
+    try {
+      const { code, version } = model.snapshot;
+      const snapshot = await request('/sessions/' + code + '/actions', 'POST', { version, type, ...values });
+      if (type === 'identify') identifyDirty = false;
+      if (type === 'review') reviewDirty = false;
+      if (type === 'configure') configDirty = false;
+      adopt(snapshot);
+      if (type === 'predict') freshPrediction();
+      const messages = {
+        configure: '本轮条件已保存，可以邀请成员加入。',
+        start: '实验已开始。先观察路网，再选择左侧工具。',
+        identify: '本组识别判断已保存，下面可核对遗漏与误选。',
+        predict: '预测已保存。推进到目标时刻后，将与实际记录对照。',
+        dispatch: '队伍已派出。由教学组织者推进时间，观察道路与可达性变化。',
+        advance: '时间已推进，地图和学习记录已更新。',
+        advance_next: '已推进至下一作业时刻或实验时限，请查看最新结果。',
+        review: '教师评阅已保存，组内成员的报告将同步更新。'
+      };
+      model.notice = messages[type] || '';
+      model.report = null;
+      if (model.snapshot.phase === 'finished') {
+        model.report = await readReport();
+      }
+      succeeded = true;
+    } catch (error) {
+      model.error = error.message;
+      // 版本冲突只刷新。不能自动重发派遣，否则可能重复扣预算。
+      if (error.code === 'version_conflict') await refresh(true);
+    } finally {
+      model.busy = false;
+      redraw();
+    }
+    return succeeded;
+  }
+
+  async function planRoute(){
+    if(model.busy||!model.snapshot)return;
+    const {from,to}=model.routeDraft;
+    model.busy=true;model.error='';model.routeResult=null;redraw();
+    try{
+      const result=await request('/sessions/'+model.snapshot.code+'/route?'+new URLSearchParams({from,to}));
+      if(result.version!==model.snapshot.version){await refresh(true);model.notice='路况已有变化，请按最新状态重新寻路。';}
+      else if(from===model.routeDraft.from&&to===model.routeDraft.to)model.routeResult=result;
+    }catch(error){model.error=error.message;}
+    finally{model.busy=false;redraw();}
+  }
+
+  async function startExperiment() {
+    if (model.busy || model.snapshot?.role !== 'teacher') return;
+    const form = document.querySelector('#learning-config');
+    if (form && !form.reportValidity()) return;
+    const values = model.configDraft;
+    if (values.scenario) {
+      const config = { scenario: values.scenario, rain: Number(values.rain), budget: Number(values.budget) };
+      if (Object.keys(config).some(key => config[key] !== model.snapshot.config[key])) {
+        // 开始时先保存界面上的有效条件，避免用户填写了新值却仍用旧预算开局。
+        if (!await command('configure', config)) return;
+      }
+    }
+    await command('start');
+  }
+
+  async function initialize() {
+    if (loading) return;
+    loading = true;
+    try {
+      model.catalog = await request('/catalog');
+      if (credential) {
+        try {
+          adopt(await request('/sessions/' + credential.code));
+          if (model.snapshot.phase === 'finished') {
+            model.report = await readReport();
+          }
+        } catch (error) {
+          model.error = error.message;
+          if (['unauthorized', 'not_found'].includes(error.code)) {
+            credential = null;
+            model.snapshot = null;
+            rememberCredential();
+          }
+        }
+      }
+    } catch (error) {
+      model.online = false;
+      model.error = error.message;
+    } finally {
+      loading = false;
+      redraw();
+    }
+  }
+
+  // views 不调用地图模块；容器 HTML 和地图挂载由 controller 协调。
+  async function readReport() {
+    try {
+      const report = await request('/sessions/' + model.snapshot.code + '/report');
+      reportFailure = false;
+      return report;
+    } catch (error) {
+      // 显示一次失败并保留手动重试入口，不在每次重绘时无限请求。
+      reportFailure = true;
+      throw error;
+    }
+  }
+
+  function view() {
+    const sceneHTML = model.snapshot?.phase === 'running' ? window.FloodGeoScene.template(false).replace(
+      '<button data-camera-preset="overview">↗ 区域总览</button>',
+      `<button data-learning-view="region" aria-pressed="${model.mapScope === 'region'}">城市总览</button><button data-learning-view="task" aria-pressed="${model.mapScope === 'task'}">教学任务区</button>`
+    ) : '';
+    return views.view({ ...model, sceneHTML });
+  }
+
+  function mount() {
+    document.body.classList.toggle('classroom-map-open', active() && model.snapshot?.phase === 'running');
+    if (!model.catalog && model.online !== false) initialize();
+    if (!poll) {
+      poll = setInterval(() => {
+        if (active() && credential && !model.busy) refresh(true);
+      }, 3000);
+    }
+    if (model.snapshot?.phase === 'running') {
+      // 选择描边属于显示草稿，不改写后端返回的实验状态。
+      const displayState = { ...model.snapshot.state, selection: model.panelOpen && model.tool === 'identify' ? [...model.identifySelection] : [] };
+      const road=model.snapshot.roads.find(road=>road.id===model.selected);
+      const chosen=road?.dispatchOptions.find(option=>option.allowed&&option.crewId===model.crewSelection[road.id])||road?.dispatchOptions.find(option=>option.allowed);
+      const routePreview=model.tool==='route'?model.routeResult?.route:model.panelOpen&&model.tool==='dispatch'?chosen?.route:null;
+      window.FloodGeoScene.mount({ state: displayState, page: 'classroom', classroomSpatial:model.snapshot.spatial, selectedRoad:model.selected, reachableNodes:model.snapshot.nodes.filter(node=>node.reachable).map(node=>node.id), routePreview });
+      window.FloodGeoScene.getMap()?.resize();
+      clearTimeout(mapTimer);
+      mapTimer = setTimeout(applyLayers, 200);
+    }
+    if (model.snapshot?.phase === 'finished' && !model.report && !model.busy && !reportFailure) {
+      model.busy = true;
+      readReport()
+        .then(report => { model.report = report; })
+        .catch(error => { model.error = error.message; })
+        .finally(() => { model.busy = false; redraw(); });
+    }
+  }
+
+  // 人口圈仅显示后端快照中的教学人口与可达性，不是实际人口密度调查。
+  function applyLayers() {
+    const map = window.FloodGeoScene.getMap();
+    const snapshot = model.snapshot;
+    if (!active() || snapshot?.phase !== 'running' || !map) return;
+    if (!map.isStyleLoaded()) {
+      // 地理数据可能晚于页面挂载完成；等待真正可绘制，再创建教学图层和构图。
+      if (waitingMap !== map) {
+        waitingMap = map;
+        map.once('idle', () => { waitingMap = null; applyLayers(); });
+      }
+      return;
+    }
+
+    const points = window.FloodGeoScene.getPoints();
+    const masked = model.panelOpen && model.tool === 'identify' && !snapshot.state.identification;
+    const selected = new Set(model.tool === 'identify' ? model.identifySelection : [model.selected]);
+    const container = map.getContainer();
+    // Only an explicit view choice or another room resets the camera. Polling,
+    // opening tools and resizing retain the user's view; coverage is guarded by
+    // the geographical renderer for the actual available data bounds.
+    const frame = [snapshot.code, model.mapScope].join(':');
+    const coordinates = snapshot.nodes.map(node => points[node.id]).filter(Boolean);
+    const lng = coordinates.map(point => point[0]), lat = coordinates.map(point => point[1]);
+    const taskBounds = [[Math.min(...lng), Math.min(...lat)], [Math.max(...lng), Math.max(...lat)]];
+    if (mapFrame !== frame) {
+      if (coordinates.length > 1) {
+        mapFrame = frame;
+        if (model.mapScope === 'region') window.FloodGeoScene.coverRegion();
+        else window.FloodGeoScene.fitCoveredBounds(taskBounds, {
+          padding: { top: container.clientWidth < 761 ? 160 : 90, bottom: 90, left: Math.min(110, container.clientWidth * .14), right: Math.min(100, container.clientWidth * .12) },
+          maxZoom: 15, duration: 0, pitch: 0
+        });
+      }
+    }
+    if (!map.getSource('learning-task-boundary')) {
+      const [[west, south], [east, north]] = taskBounds;
+      map.addSource('learning-task-boundary', { type: 'geojson', data: { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [[[west - .002, south - .002], [east + .002, south - .002], [east + .002, north + .002], [west - .002, north + .002], [west - .002, south - .002]]] } } });
+      map.addLayer({ id: 'learning-task-boundary', type: 'line', source: 'learning-task-boundary', paint: { 'line-color': '#a96d35', 'line-width': 1.5, 'line-dasharray': [5, 4], 'line-opacity': .8 } });
+    }
+    map.setLayoutProperty('learning-task-boundary', 'visibility', 'visible');
+    const data = {
+      type: 'FeatureCollection',
+      features: snapshot.nodes.filter(node => node.pop && points[node.id]).map(node => ({
+        type: 'Feature',
+        properties: { id: node.id, pop: node.pop, reachable: node.reachable ? 1 : 0, selected: selected.has(node.id) ? 1 : 0 },
+        geometry: { type: 'Point', coordinates: points[node.id] }
+      }))
+    };
+    if (map.getSource('learning-population')) {
+      map.getSource('learning-population').setData(data);
+    } else {
+      map.addSource('learning-population', { type: 'geojson', data });
+      map.addLayer({
+        id: 'learning-population',
+        type: 'circle',
+        source: 'learning-population',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['get', 'pop'], 0, 10, 320, 38],
+          'circle-color': ['case', ['==', ['get', 'reachable'], 1], '#208e74', '#c94c59'],
+          'circle-opacity': .22,
+          'circle-stroke-width': 2,
+          'circle-stroke-color': ['case', ['==', ['get', 'reachable'], 1], '#26977d', '#c94c59']
+        }
+      });
+    }
+    const reachColor = ['case', ['==', ['get', 'reachable'], 1], '#208e74', '#c94c59'];
+    map.setPaintProperty('learning-population', 'circle-color', masked ? '#7897ab' : reachColor);
+    map.setPaintProperty('learning-population', 'circle-stroke-width', ['case', ['==', ['get', 'selected'], 1], 4, 1.5]);
+    map.setPaintProperty('learning-population', 'circle-stroke-color', ['case', ['==', ['get', 'selected'], 1], '#e5b45f', masked ? '#9bb4c3' : reachColor]);
+    if (selectionMap !== map) {
+      map.on('click', 'learning-population', event => {
+        if (active() && model.tool === 'identify' && event.features?.[0]) {
+          chooseNode(event.features[0].properties.id);
+        }
+      });
+      map.on('mouseenter', 'learning-population', () => {
+        if (active() && model.tool === 'identify') map.getCanvas().style.cursor = 'pointer';
+      });
+      map.on('mouseleave', 'learning-population', () => { map.getCanvas().style.cursor = ''; });
+      selectionMap = map;
+    }
+    for (const marker of document.querySelectorAll('.geo-marker[data-node]')) {
+      const chosen = model.tool === 'identify' ? selected.has(marker.dataset.node) : marker.dataset.node === model.selected;
+      marker.classList.toggle('is-learning-selected', chosen);
+      marker.setAttribute('aria-pressed', String(chosen));
+    }
+    for (const marker of document.querySelectorAll('.geo-road-marker[data-road]')) {
+      marker.classList.toggle('is-learning-selected', marker.dataset.road === model.selected);
+    }
+    const groups = [
+      ['people', ['learning-population']],
+      ['roads', ['teaching-roads', 'teaching-roads-halo']],
+      ['floods', ['flood-areas', 'flood-depth']],
+      ['buildings', ['building-footprints', 'buildings-3d', 'scene-roofs', 'scene-windows']]
+    ];
+    for (const [name, ids] of groups) {
+      for (const id of ids) {
+        if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', model.layers[name] ? 'visible' : 'none');
+      }
+    }
+    document.querySelector('.learning-shell')?.classList.toggle('lc-hide-roads', !model.layers.roads);
+  }
+
+  function disconnect() {
+    if (model.busy) return;
+    if (model.snapshot) retainSession(model.snapshot);
+    credential = null;
+    model.snapshot = null;
+    model.report = null;
+    model.selected = null;
+    model.error = '';
+    resetWorkspace(null);
+    rememberCredential();
+    redraw();
+  }
+
+  function escapeHTML(value) {
+    return String(value ?? '').replace(/[&<>"']/g, character => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[character]);
+  }
+
+  function exportReport() {
+    if (!model.report) return;
+    const { snapshot } = model;
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>本轮实验报告</title>
+      <style>
+        *{box-sizing:border-box}body{font:15px/1.8 "Microsoft YaHei",sans-serif;color:#263944;background:#fff;max-width:1100px;margin:30px auto;padding:24px}
+        button{display:none!important}h2{font-size:24px}h3{font-size:19px}h4{font-size:16px}p{overflow-wrap:anywhere}.lc-icon{width:20px;height:20px;vertical-align:middle}
+        .lc-report-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:25px 0}.lc-report-metrics>div,.lc-card{border:1px solid #d7e0e5;border-radius:6px;padding:20px}
+        .lc-report-metrics strong{display:block;font-size:25px}.lc-report-metrics em{font-size:14px;font-style:normal}.lc-report-metrics span{display:block;color:#5d707b;font-size:13px}
+        .lc-card{margin:20px 0}.lc-section-title{display:flex;gap:12px;align-items:start}.lc-section-number{font-size:20px;color:#5a777f}.lc-section-title h3{margin:0}.lc-section-title p{margin-top:5px}
+        .lc-score-row{padding:16px 0;border-bottom:1px solid #e0e7eb}.lc-score-row>span{float:right}.lc-score-row p{margin:8px 0}.hint{color:#5d707b;font-size:13px}
+        table{border-collapse:collapse;width:100%;font-size:14px}th,td{padding:12px;text-align:left;border:1px solid #d7e0e5;vertical-align:top}th{background:#f3f6f7}.lc-table-scroll{overflow-x:auto}
+        .lc-event-list{padding-left:22px}.lc-event-list li{padding:8px 0}.lc-event-time{color:#476c69}.lc-event-time small{margin-left:4px}.lc-event-list p{margin:4px 0}
+        .lc-identify-feedback dl{display:grid;grid-template-columns:90px 1fr;gap:8px}.lc-identify-feedback dd{margin:0}.lc-report-footer{border-top:1px solid #d7e0e5;margin-top:25px;padding-top:16px}
+        .lc-recovery-chart{display:block;width:100%;height:auto;max-height:270px;font:13px "Microsoft YaHei",sans-serif;fill:#526b74}.lc-chart-grid{stroke:#d8e3e5;stroke-width:1}.lc-chart-line{stroke:#297a69;stroke-width:2.5;vector-effect:non-scaling-stroke}.lc-chart-end{fill:#297a69}.lc-chart-legend{display:block;font-size:13px;color:#526b74}
+        .lc-report-total{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:16px 0;border-bottom:1px solid #d7e0e5;margin-bottom:18px}.lc-report-total strong{font-size:28px}.lc-report-total strong small{font-size:14px}.lc-review-state p{white-space:pre-wrap}.lc-review-state small{color:#526b74}
+        @media(max-width:650px){body{padding:16px;margin:0}.lc-report-metrics{grid-template-columns:1fr 1fr}.lc-card{padding:16px}th,td{padding:8px}}
+        @media print{body{max-width:none;padding:0;margin:0}.lc-card,.lc-report-metrics>div{break-inside:avoid}summary{display:none}}
+      </style></head><body>
+      ${views.renderReport({ ...model, exporting: true }).replace(/<details\b(?![^>]*\bopen\b)([^>]*)>/g, '<details$1 open>')}
+      <p>教学模型：${escapeHTML(snapshot.model.name)}。数据来自后端保存的实验${snapshot.code}。</p></body></html>`;
+    const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = '课堂实验报告-' + snapshot.code + '.html';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  // 事件只在课堂工作区生效，保留旧平台的其他入口。
+  document.addEventListener('click', event => {
+    if (!active()) return;
+    const mapView = event.target.closest('[data-learning-view]');
+    if (mapView) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      model.mapScope = mapView.dataset.learningView;
+      mapFrame = '';
+      applyLayers();
+      document.querySelectorAll('[data-learning-view]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.learningView === model.mapScope)));
+      return;
+    }
+    const tool = event.target.closest('[data-learning-tool]');
+    if (tool && !tool.disabled) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      model.tool = tool.dataset.learningTool;
+      model.panelOpen = true;
+      model.layersOpen = false;
+      model.error = '';
+      model.notice = '';
+      redraw();
+      return;
+    }
+    if (event.target.closest('[data-geo-action="topology"],[data-action="geo-topology"]')) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const topology = document.querySelector('.lc-topology');
+      if (topology) {
+        topology.open = true;
+        topology.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      return;
+    }
+    const road = event.target.closest('[data-road],[data-node],[data-learning-road],[data-learning-node]');
+    if (road) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const nodeId = road.dataset.node || road.dataset.learningNode;
+      if (nodeId) chooseNode(nodeId);
+      else chooseRoad(road.dataset.road || road.dataset.learningRoad);
+      return;
+    }
+    const button = event.target.closest('[data-learning]');
+    const entry = event.target.closest('[data-learning-entry]');
+    const preparation = event.target.closest('[data-learning-preparation]');
+    const reportTab = event.target.closest('[data-learning-report-tab]');
+    if (entry || preparation || reportTab) {
+      event.preventDefault();
+      if (model.busy) return;
+      if (entry) model.entry = entry.dataset.learningEntry;
+      if (preparation) model.preparation = preparation.dataset.learningPreparation;
+      if (reportTab) model.reportTab = reportTab.dataset.learningReportTab;
+      model.error = '';
+      redraw();
+      const focusTarget = entry ? '.lc-entry-form input' : preparation ? '#lc-preparation-content' : '#lc-report-content';
+      document.querySelector(focusTarget)?.focus({ preventScroll: true });
+      return;
+    }
+    const resume = event.target.closest('[data-learning-resume]');
+    if (resume && !resume.disabled) { event.preventDefault(); resumeSession(resume.dataset.learningResume); return; }
+    if (!button || button.disabled) return;
+    event.preventDefault();
+
+    switch (button.dataset.learning) {
+      case 'close-panel': model.panelOpen = false; redraw(); document.querySelector('[data-learning-tool="' + model.tool + '"]')?.focus({ preventScroll: true }); break;
+      case 'clear-route': model.routeResult=null;redraw();break;
+      case 'new-road-classroom': disconnect();model.entry='create';redraw();break;
+      case 'layers': model.layersOpen = !model.layersOpen; redraw(); break;
+      case 'explain':
+        model.explain = !model.explain;
+        redraw();
+        break;
+      case 'retry':
+        model.online = null;
+        model.error = '';
+        initialize();
+        redraw();
+        break;
+      case 'refresh': refresh(); break;
+      case 'disconnect': disconnect(); break;
+      case 'start': startExperiment(); break;
+      case 'advance': command('advance', { minutes: 5 }); break;
+      case 'advance-next': command('advance_next'); break;
+      case 'clear-identify':
+        if (canIdentify()) {
+          model.identifySelection = [];
+          identifyDirty = true;
+          redraw();
+        }
+        break;
+      case 'fresh-prediction': freshPrediction(); redraw(); break;
+      case 'finish':
+        window.modal('<h2>结束本轮实验？</h2><p>当前时刻、投入及未完成的作业都会写入报告。</p><button class="primary" data-learning="confirm-finish">确认结束并生成报告</button>');
+        break;
+      case 'confirm-finish':
+        document.querySelector('#dialog').close();
+        command('finish');
+        break;
+      case 'unselect':
+        model.selected = null;
+        redraw();
+        break;
+      case 'report':
+        model.report = null;
+        reportFailure = false;
+        redraw();
+        break;
+      case 'export': exportReport(); break;
+    }
+  }, true);
+
+  document.addEventListener('submit', event => {
+    if (!active()) return;
+    const form = event.target;
+    if (!['learning-create', 'learning-join', 'learning-config', 'learning-dispatch', 'learning-identify', 'learning-predict', 'learning-review','learning-route-query'].includes(form.id)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if(form.id==='learning-route-query'){planRoute();return;}
+    if (form.id === 'learning-create' || form.id === 'learning-join') {
+      connect(form, form.id === 'learning-join');
+      return;
+    }
+    const values = Object.fromEntries(new FormData(form));
+    if (form.id === 'learning-config') {
+      command('configure', { scenario: values.scenario, rain: Number(values.rain), budget: Number(values.budget) });
+    }
+    if (form.id === 'learning-dispatch') {
+      command('dispatch', { edgeId: values.edgeId, crewId: values.crewId });
+    }
+    if (form.id === 'learning-identify') {
+      command('identify', { selected: [...model.identifySelection] });
+    }
+    if (form.id === 'learning-predict') {
+      command('predict', {
+        target: Number(values.target), population: Number(values.population),
+        spent: Number(values.spent), reason: values.reason
+      });
+    }
+    if (form.id === 'learning-review') {
+      command('review', { ratings: { evidence: Number(values.evidence), analysis: Number(values.analysis), improvement: Number(values.improvement) }, comment: values.comment });
+    }
+  }, true);
+
+  // 保存输入中的预测草稿，其他成员更新实验时重新显示也不会丢失。
+  document.addEventListener('input', event => {
+    if (!active()) return;
+    const draft = event.target.closest('#learning-create') ? model.createDraft : event.target.closest('#learning-join') ? model.joinDraft : event.target.closest('#learning-config') ? model.configDraft : null;
+    if (draft && event.target.name) {
+      draft[event.target.name] = event.target.value;
+      if (draft === model.configDraft) configDirty = true;
+    }
+    if (event.target.closest('#learning-predict') && Object.hasOwn(model.predictionDraft, event.target.name)) {
+      model.predictionDraft[event.target.name] = event.target.value;
+    }
+    if (event.target.closest('#learning-review') && Object.hasOwn(model.reviewDraft, event.target.name)) {
+      model.reviewDraft[event.target.name] = event.target.value;
+      reviewDirty = true;
+    }
+  });
+
+  document.addEventListener('change', event => {
+    if (!active()) return;
+    const input = event.target;
+    if(input.closest('#learning-route-query')&&['from','to'].includes(input.name)){
+      model.routeDraft[input.name]=input.value;model.routeResult=null;redraw();return;
+    }
+    if (input.id === 'learning-road') {
+      chooseRoad(input.value);
+    }
+    if (input.name === 'crewId' && input.closest('#learning-dispatch')) {
+      model.crewSelection[model.selected] = input.value;
+      redraw();
+    }
+    if (input.hasAttribute('data-learning-identify-node') && canIdentify()) {
+      const selected = new Set(model.identifySelection);
+      input.checked ? selected.add(input.value) : selected.delete(input.value);
+      model.identifySelection = [...selected];
+      identifyDirty = true;
+      redraw();
+    }
+    if (input.dataset.learningLayer) {
+      model.layers[input.dataset.learningLayer] = input.checked;
+      applyLayers();
+    }
+    if (input.name === 'scenario' && input.closest('#learning-create,#learning-config')) {
+      const scenario = model.catalog.scenarios.find(value => value.id === input.value);
+      if (scenario) {
+        input.form.elements.rain.value = scenario.rain;
+        input.form.elements.budget.value = scenario.budget;
+        const draft = input.form.id === 'learning-create' ? model.createDraft : model.configDraft;
+        Object.assign(draft, { scenario: scenario.id, rain: String(scenario.rain), budget: String(scenario.budget) });
+        if (input.form.id === 'learning-config') configDirty = true;
+      }
+    }
+  });
+
+  document.addEventListener('keydown', event => {
+    if (active() && event.key === 'Escape' && !document.querySelector('#dialog')?.open) {
+      if (model.layersOpen) { model.layersOpen = false; redraw(); document.querySelector('[data-learning=layers]')?.focus(); }
+      else if (model.panelOpen) { model.panelOpen = false; redraw(); document.querySelector('[data-learning-tool="' + model.tool + '"]')?.focus(); }
+      return;
+    }
+    if (active() && ['Enter', ' '].includes(event.key) && event.target.matches('[data-learning-road],[data-learning-node]')) {
+      event.preventDefault();
+      if (event.target.dataset.learningNode) chooseNode(event.target.dataset.learningNode);
+      else chooseRoad(event.target.dataset.learningRoad);
+    }
+  });
+
+  window.addEventListener('flood-map-ready', applyLayers);
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    if (active()) resizeTimer = setTimeout(applyLayers, 180);
+  });
+  window.addEventListener('flood-view-updated', () => {
+    if (!active()) {
+      document.body.classList.remove('classroom-map-open');
+      const map = window.FloodGeoScene.getMap();
+      if (map?.getLayer('learning-population')) map.setLayoutProperty('learning-population', 'visibility', 'none');
+      if (map?.getLayer('learning-task-boundary')) map.setLayoutProperty('learning-task-boundary', 'visibility', 'none');
+      map?.getSource('classroom-access')?.setData({type:'FeatureCollection',features:[]});
+      mapFrame = '';
+    }
+  });
+
+  // 旧平台只需要这两个入口，无需知道课堂内部如何分层。
+  return Object.freeze({ view, mount });
+})();
+
+;
+/* Source: frontend/app.js */
 'use strict';
 const E=FloodLab,$=s=>document.querySelector(s),esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const KEY='flood-lab-current-v1',HISTORY='flood-lab-history-v1';
 let state=E.create(),page='home',timer=null,playbackSpeed=1,dispatchFastForward=false,zoom=1,showLabels=true,routeView=null,roadFilter='all',toastTimer;
 let storageError=false;
 try{const saved=localStorage.getItem(KEY);if(saved)state=E.validate(JSON.parse(saved));}catch{storageError=true;}
-const pages=[...FloodCommandUI.pages,['home','学习导览'],['compare','方案比较'],['branch-lab','分支复盘'],['challenge-lab','学生出题'],['scene','徐州三维场景'],['overview','灾情感知'],['identify','孤岛识别'],['plan','预算与通道规划'],['resources','抢修队伍派遣'],['simulate','动态推演'],['assessment','决策考核'],['results','学习评价'],['settings','情景配置'],['records','实验记录']];
+const pages=[['classroom','课堂工作区'],...FloodCommandUI.pages,['home','学习导览'],['real-lab','实景路网仿真'],['compare','方案比较'],['branch-lab','分支复盘'],['challenge-lab','学生出题'],['scene','徐州三维场景'],['overview','灾情感知'],['identify','孤岛识别'],['plan','预算与通道规划'],['resources','抢修队伍派遣'],['simulate','动态推演'],['assessment','决策考核'],['results','学习评价'],['settings','情景配置'],['records','实验记录']];
 // Preserve old links and stored experiments while giving each task its own page.
 const pageAliases={overview:'identify'};
 const canonicalPage=id=>pageAliases[id]||id;
 const navigationGroups=[
- {id:'teaching',title:'基础实验',tabs:[['home','学习导览'],['identify','孤岛识别'],['plan','预算与通道规划'],['resources','抢修队伍派遣'],['simulate','动态推演'],['results','学习评价']]},
+ {id:'teaching',title:'基础实验',tabs:[['home','学习导览'],['real-lab','实景路网仿真'],['identify','孤岛识别'],['plan','预算与通道规划'],['resources','抢修队伍派遣'],['simulate','动态推演'],['results','学习评价']]},
  {id:'inquiry',title:'探究练习',tabs:[['compare','方案比较'],['branch-lab','分支复盘'],['challenge-lab','学生出题']]},
  {id:'exercise',title:'协作实践',tabs:[['command-duel','双向脚本对战'],['command-scripts','情景脚本'],['command','情景任务'],['command-dispatch','力量派遣'],['command-orders','下达指令'],['command-reports','问题作答'],['command-discussion','小组讨论']]},
  {id:'advanced',title:'参数、考核与资料',tabs:[['settings','实验参数'],['assessment','决策考核'],['command-library','资源与题库'],['scene','区域地图'],['command-room','协作房间'],['command-review','协作评估'],['command-replay','协作回放'],['records','实验记录'],['command-admin','数据备份']]}
 ];
-let teachingRoadsOpen=false,mobileNavOpen=false;
+let teachingRoadsOpen=false,mobileNavOpen=false,lessonHelpOpen=false;
 function navigationGroup(id){return navigationGroups.find(g=>g.tabs.some(t=>t[0]===canonicalPage(id)))||navigationGroups[0];}
-function sidebar(){return '<button class="nav-mobile-toggle" data-action="menu-toggle" aria-controls="course-navigation" aria-expanded="'+mobileNavOpen+'"><span>课程目录</span><b>'+esc(pages.find(p=>p[0]===page)?.[1]||'学习导览')+'</b><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.4"/></svg></button><div id="course-navigation" class="nav-links"><div class="nav-course"><span>VIRTUAL LEARNING LAB</span><b>交通孤岛与通道决策</b><small>学习 · 实验 · 探究</small></div>'+navigationGroups.map(g=>{const links=g.tabs.map(([id,title],i)=>`<button data-nav="${id}" class="${page===id?'active':''}" ${page===id?'aria-current="page"':''}><span class="num">${String(i+1).padStart(2,'0')}</span>${title}</button>`).join('');return g.id==='advanced'?`<details class="nav-advanced" ${g.tabs.some(t=>t[0]===page)?'open':''}><summary>${g.title}</summary>${links}</details>`:`<section class="nav-section"><div class="nav-caption">${g.title}</div>${links}</section>`;}).join('')+'<div class="nav-bottom nav-caption">交通孤岛 · 通道决策<br>学生实践平台 v4.0</div></div>';}
+function navIcon(id){const paths={home:'M3 10l9-7 9 7M5 9v11h5v-6h4v6h5V9','real-lab':'M3 5l6-2 6 2 6-2v16l-6 2-6-2-6 2V5M9 3v16M15 5v16',identify:'M10 17a7 7 0 1 0 0-14 7 7 0 0 0 0 14M15 15l6 6M7 10h6M10 7v6',plan:'M8 4h12v16H4V8M4 4h4v4H4zM8 12h8M8 16h5',resources:'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M17 4a4 4 0 0 1 0 7M22 21v-2a4 4 0 0 0-3-3.87',simulate:'M8 5l11 7-11 7V5',results:'M4 3v18h17M8 16v-4M13 16V8M18 16V5',compare:'M8 3v18M16 3v18M3 7h10M11 17h10', 'branch-lab':'M6 3v12a4 4 0 0 0 4 4h8M6 9h8a4 4 0 0 0 4-4V3M15 16l3 3-3 3','challenge-lab':'M12 3v18M3 12h18M5 5l14 14M19 5L5 19','command-duel':'M4 3l17 17M14 20h7v-7M20 3L3 20M3 13v7h7', 'command-scripts':'M8 3h8l4 4v14H4V3h4M15 3v5h5M8 12h8M8 16h5',command:'M4 4h16v12H9l-5 4V4M8 8h8M8 12h5','command-dispatch':'M3 16V7h12v9H3M15 10h3l3 4v2h-6M6 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4M18 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4','command-orders':'M4 10l16-6v16L4 14v-4M7 15v5h4l-1-5','command-reports':'M8 8a4 4 0 0 1 8 0c0 3-4 3-4 6M12 18h.01M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20','command-discussion':'M21 11a8 8 0 0 1-8 8H7l-4 3v-7a8 8 0 0 1 8-12h2a8 8 0 0 1 8 8M8 10h8M8 14h5',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2'};return '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="'+(paths[id]||'M4 4h16v16H4V4M8 8h8M8 12h8M8 16h5')+'"/></svg>';}
+function sidebar(){
+ const active=navigationGroup(page).id;
+ return `<button class="nav-mobile-toggle" data-action="menu-toggle" aria-controls="course-navigation" aria-expanded="${mobileNavOpen}"><span>课程目录</span><b>${esc(pages.find(p=>p[0]===page)?.[1]||'学习导览')}</b>${navIcon('plan')}</button><div id="course-navigation" class="nav-links"><div class="nav-course"><span>实验课程</span><b>学习与实践</b><button data-action="nav-focus" aria-label="收起课程目录" title="收起课程目录">${navIcon('compare')}</button></div>${navigationGroups.map(g=>`<details class="nav-group" ${g.id===active?'open':''}><summary title="${g.title}">${navIcon({teaching:'real-lab',inquiry:'branch-lab',exercise:'resources',advanced:'settings'}[g.id])}<span class="nav-label">${g.title}</span><i>⌄</i></summary><div class="nav-group-links">${g.tabs.map(([id,title])=>`<button data-nav="${id}" title="${title}" aria-label="${title}" class="${page===id?'active':''}" ${page===id?'aria-current="page"':''}><span class="num">${navIcon(id)}</span><span class="nav-label">${title}</span></button>`).join('')}</div></details>`).join('')}<div class="nav-bottom">进度自动保存在当前浏览器<br><span>学生实践平台 v5.5</span></div></div>`;
+}
 const statusNames={open:'正常通行',limited:'限制通行',blocked:'道路阻断',repair:'正在抢修'},colors={open:'#43c9af',limited:'#ffd078',blocked:'#fc727e',repair:'#6faaff'};
 const names=id=>E.nodes.find(n=>n.id===id)?.name||id;
 const badge=z=>`<span class="badge ${z}">${statusNames[z]}</span>`;
@@ -26,7 +1236,7 @@ function experimentHistory(){try{const v=JSON.parse(localStorage.getItem(HISTORY
 function archive(){try{const records=experimentHistory();records.unshift({id:Date.now(),date:new Date().toLocaleString('zh-CN'),state:E.clone(state)});localStorage.setItem(HISTORY,JSON.stringify(records.slice(0,20)));return true;}catch{toast('记录保存失败，请导出 JSON 备份');return false;}}
 function stop(){clearInterval(timer);timer=null;dispatchFastForward=false;}
 function startPlayback(){clearInterval(timer);timer=setInterval(tick,1000/playbackSpeed);}
-function navigate(id){mobileNavOpen=false;id=canonicalPage(id);if(id!=='simulate')stop();if(!FloodCommandUI.isPage(id))FloodCommandUI.stop();if(['command-replay','command-duel'].includes(id))FloodCommandUI.stop();if(!pages.some(p=>p[0]===id))id='home';page=id;location.hash=id;render();}
+function navigate(id){mobileNavOpen=false;id=canonicalPage(id);if(id!=='simulate')stop();if(!FloodCommandUI.isPage(id))FloodCommandUI.stop();if(['command-replay','command-duel'].includes(id))FloodCommandUI.stop();if(!pages.some(p=>p[0]===id))id='home';page=id;location.hash=id;render();window.scrollTo({top:0,behavior:'instant'});}
 function modal(html){$('#dialog-content').innerHTML=html;if(!$('#dialog').open)$('#dialog').showModal();window.dispatchEvent(new Event('flood-dialog-open'));}
 function confirmAction(title,body,action){modal(`<h2>${title}</h2><p>${body}</p><div class="actions"><button class="primary" data-action="${action}">确定</button><button data-action="close-dialog">取消</button></div>`);}
 function nodeOptions(selected){return E.nodes.map(n=>`<option value="${n.id}" ${n.id===selected?'selected':''}>${n.id} · ${n.name}</option>`).join('');}
@@ -36,8 +1246,8 @@ function scene(){const st=E.stats(state);return `<div class="scene-layout">${Flo
 function metrics(){const s=E.stats(state);$('#metrics').innerHTML=[['受影响区域人口',s.pop,'人','实验区域内的全部人口',''],['基地不可达人口',s.isolated,'人',s.groups.length+' 个交通孤岛',s.isolated?'red':'green'],['阻断 / 作业路段',s.blocked,'处','共 '+state.edges.length+' 条道路与桥梁','amber'],['实验已用时间',state.time,'分钟','时限 '+state.horizon+' 分钟 · 预算剩余 '+(state.budget-state.spent)+' 万元','green']].map(([label,v,unit,sub,cl])=>`<div class="metric"><div class="label">${label}</div><strong class="${cl}">${v}<small>${unit}</small></strong><div class="sub">${sub}</div></div>`).join('');}
 function overview(){const scenario=E.scenarios.find(v=>v.id===state.scenario),st=E.stats(state);return `<section class="home-intro"><div class="home-copy"><span class="home-kicker">智慧教育 / 应急决策训练</span><h2>读懂灾情，作出判断<br><em>让生命通道重新连通</em></h2><p>洪涝灾害交通孤岛识别与生命通道抢通<br>虚拟仿真实验教学平台</p><div class="actions"><button class="primary" data-nav="identify">进入孤岛识别 →</button><button data-nav="assessment">进入决策考核</button><button data-action="help">实验指南</button></div><small>当前实验会保留；开始新考核前可确认并存档。</small></div><aside class="home-question"><span>本次任务 · 你的判断会改变结果</span><h3>有限的时间与资源，<br>先抢通哪一条路？</h3><p>识别被困聚落，安排专业队伍。面对桥梁中断与设备故障，重新评估方案，并从最终成绩中复盘每一次选择。</p><div class="home-facts"><div><b>3</b>教学情景</div><div><b>4</b>专业队伍</div><div><b>4</b>评价维度</div></div></aside></section><section class="home-flow" aria-label="实验学习流程"><div><b>01</b><span>观察与识别<small>判断路网连通性</small></span></div><div><b>02</b><span>规划与调度<small>权衡工期、预算与重点设施</small></span></div><div><b>03</b><span>推演与决策<small>应对动态灾情与突发事件</small></span></div><div><b>04</b><span>评分与复盘<small>查看操作后果和改进依据</small></span></div></section><div class="workspace"><section class="panel"><div class="panel-head"><h2>区域灾情态势</h2><small>情景时刻 T+${String(state.time).padStart(3,'0')} min</small></div>${map()}</section><aside class="stack"><section class="panel"><div class="panel-head"><h2>灾情简报</h2><span class="tag">${scenario.level}</span></div><div class="panel-body"><p class="hint">${scenario.desc}</p><div class="stat-row"><span>模拟降雨强度</span><b>${state.rain} mm/h</b></div><div class="stat-row"><span>重点设施可达</span><b>${st.urgent} / 2</b></div><div class="stat-row"><span>基地可达人口</span><b>${st.available} 人</b></div><div class="stat-row"><span>抢修队伍</span><b>${state.crews.filter(c=>!c.job).length} / 4 待命</b></div><div class="notice spaced">优先保障医院 H 与养老院 B；教学目标为 90 分钟内恢复通道。</div></div></section><section class="panel"><div class="panel-head"><h2>本次实验任务</h2></div><div class="panel-body">${[['识别交通孤岛','提交与救援基地断连的聚落',state.identification],['制定抢通方案','安排道路顺序和匹配工种',state.plan.length||state.spent],['推演并复盘','观察动态灾情，完成评价',state.ended]].map(([t,d,done],i)=>`<div class="task-check"><b>${done?'✓':i+1}</b><div>${t}<small>${d}</small></div></div>`).join('')}<div class="actions"><button class="primary" data-nav="identify">开始孤岛识别</button></div></div></section></aside></div><section class="panel spaced"><div class="panel-head"><h2>道路监测清单</h2><select id="road-filter" aria-label="道路状态筛选"><option value="all">全部道路</option>${Object.entries(statusNames).map(([k,v])=>`<option value="${k}" ${roadFilter===k?'selected':''}>${v}</option>`).join('')}</select></div>${roadTable()}</section>`;}
 function roadTable(){const list=state.edges.filter(e=>roadFilter==='all'||E.status(state,e)===roadFilter);return `<div class="table-wrap"><table><thead><tr><th>道路编号</th><th>连接区域</th><th>长度</th><th>积水深度</th><th>状态</th><th>操作</th></tr></thead><tbody>${list.map(e=>`<tr><td>${e.id}${e.type==='bridge'?' · 桥梁':''}</td><td>${names(e.a)} / ${names(e.b)}</td><td>${e.length} km</td><td>${e.depth.toFixed(2)} m</td><td>${badge(E.status(state,e))}</td><td><button class="small" data-road="${e.id}">查看</button></td></tr>`).join('')||'<tr><td colspan="6">当前筛选没有道路</td></tr>'}</tbody></table></div>`;}
-function identify(){return `<p class="section-intro">判断哪些聚落无法通过可通行道路到达救援基地 S。选择全部受困聚落后提交；橙色限行道路仍可通行。</p><div class="workspace"><section class="panel">${map()}</section><aside class="panel"><div class="panel-head"><h2>你的识别结果</h2><small>已选 ${state.selection.length} 处</small></div><div class="panel-body">${E.nodes.filter(n=>n.pop).map(n=>`<label class="select-card"><input type="checkbox" data-select-node="${n.id}" ${state.selection.includes(n.id)?'checked':''} ${state.time||state.spent?'disabled':''}><span>${n.name}<small>${n.pop} 人${['B','H'].includes(n.id)?' · 重点保障':''}</small></span></label>`).join('')}<button class="primary" data-action="identify" ${state.time||state.spent?'disabled':''}>提交识别结果</button>${state.identification?`<div class="notice spaced">识别反馈：F1 ${Math.round(state.identification.score/25*100)}%。${state.identification.score===25?'已正确识别全部受困聚落。':'仍有漏选或误选。请检查到基地的连通路径。'}</div><div class="actions"><button data-nav="plan">进入通道规划</button></div>`:''}</div></aside></div>`;}
-function plan(){const st=E.stats(state);return `<div class="two-col"><section class="panel"><div class="panel-head"><h2>生命通道查询</h2><span class="tag">最短通行时间</span></div><div class="panel-body"><div class="form-grid"><label class="field">出发点<select id="route-from">${nodeOptions(routeView?.from||'S')}</select></label><label class="field">目的地<select id="route-to">${nodeOptions(routeView?.to||'H')}</select></label></div><div class="actions"><button class="primary" data-action="route">计算可通行路线</button><button data-action="clear-route">清除路线</button></div>${routeView?routeView.error?`<div class="notice spaced">当前无可通行路线。先抢通连接目标区域的阻断路段，再重新查询。</div>`:`<div class="route-result"><b>${routeView.nodes.map(names).join(' → ')}</b><p>${routeView.edges.join(' / ')||'原地'} · ${routeView.distance} km · 预计 ${routeView.minutes} 分钟</p><small>正常道路按 30 km/h、限行道路按 15 km/h 计算。</small></div>`:'<p class="hint spaced">路线依据当前道路状态计算，推演中会随道路变化更新。</p>'}</div></section><section class="panel"><div class="panel-head"><h2>抢通顺序</h2><small>${state.plan.length} 项待执行</small></div><div class="panel-body"><p class="hint">在地图中选择阻断道路加入计划，可上下调整顺序。推演时优先派遣可进场且工种匹配的空闲队伍。</p><ol class="order-list">${state.plan.map((id,i)=>{const e=state.edges.find(e=>e.id===id);return `<li><span class="order">${String(i+1).padStart(2,'0')}</span><div class="grow">${id} · ${names(e.a)} / ${names(e.b)}<small>${e.work} 分钟作业 · ${e.cost} 万元</small></div><button class="small" data-move="${id}" data-dir="-1" aria-label="上移 ${id}" ${i===0?'disabled':''}>↑</button><button class="small" data-move="${id}" data-dir="1" aria-label="下移 ${id}" ${i===state.plan.length-1?'disabled':''}>↓</button><button class="small" data-remove="${id}" aria-label="移除 ${id}">×</button></li>`}).join('')||'<li class="hint">尚未添加道路，请点击下方地图中的红色路段。</li>'}</ol><div class="actions"><button data-action="recommend">生成参考顺序</button><button class="primary" data-nav="resources">前往抢修队伍派遣 →</button></div><p class="hint spaced">参考方案按“新增可达人口＋重点设施权重 / 工期与投入”逐步选择，供比较学习，不保证全局最优。</p></div></section></div><section class="panel spaced"><div class="panel-head"><h2>通道规划图</h2><small>${st.groups.length} 个孤岛待恢复</small></div>${map()}</section>`;}
+function identify(){return `<div class="workspace identify-workspace"><section class="panel identify-map">${map()}</section><aside class="panel identify-answer"><div class="panel-head"><div><span class="eyebrow">提交你的判断</span><h2>哪些聚落无法到达？</h2></div><span class="tag">已选 ${state.selection.length} 处</span></div><div class="panel-body"><p class="answer-intro">选择全部断连聚落，再提交验证。</p><div class="identify-options">${E.nodes.filter(n=>n.pop).map(n=>`<label class="select-card"><input type="checkbox" data-select-node="${n.id}" ${state.selection.includes(n.id)?'checked':''} ${state.time||state.spent?'disabled':''}><span class="answer-place"><b>${n.name}</b><small>${n.id}${['B','H'].includes(n.id)?' · 重点保障':''}</small></span><span class="answer-pop">${n.pop}<small> 人</small></span></label>`).join('')}</div><div class="answer-actions"><button class="primary" data-action="identify" ${state.time||state.spent?'disabled':''}>提交识别结果</button><p>橙色限行道路仍可通行。</p></div>${state.identification?`<div class="notice spaced">识别反馈：F1 ${Math.round(state.identification.score/25*100)}%。${state.identification.score===25?'已正确识别全部受困聚落。':'仍有漏选或误选。请检查到基地的连通路径。'}</div><div class="actions"><button data-nav="plan">进入通道规划 →</button></div>`:''}</div></aside></div>`;}
+function plan(){const st=E.stats(state);return `<div class="planning-layout"><section class="panel planning-map">${map()}</section><aside class="planning-side"><section class="panel"><div class="panel-head"><h2>生命通道查询</h2><span class="tag">最短通行时间</span></div><div class="panel-body"><div class="form-grid"><label class="field">出发点<select id="route-from">${nodeOptions(routeView?.from||'S')}</select></label><label class="field">目的地<select id="route-to">${nodeOptions(routeView?.to||'H')}</select></label></div><div class="actions"><button class="primary" data-action="route">计算可通行路线</button><button data-action="clear-route">清除路线</button></div>${routeView?routeView.error?`<div class="notice spaced">当前无可通行路线。先抢通连接目标区域的阻断路段，再重新查询。</div>`:`<div class="route-result"><b>${routeView.nodes.map(names).join(' → ')}</b><p>${routeView.edges.join(' / ')||'原地'} · ${routeView.distance} km · 预计 ${routeView.minutes} 分钟</p><small>正常道路按 30 km/h、限行道路按 15 km/h 计算。</small></div>`:'<p class="hint spaced">路线依据当前道路状态计算，推演中会随道路变化更新。</p>'}</div></section><section class="panel"><div class="panel-head"><h2>抢通顺序</h2><small>${state.plan.length} 项待执行</small></div><div class="panel-body"><p class="hint">在地图中选择阻断道路加入计划，可上下调整顺序。推演时优先派遣可进场且工种匹配的空闲队伍。</p><ol class="order-list">${state.plan.map((id,i)=>{const e=state.edges.find(e=>e.id===id);return `<li><span class="order">${String(i+1).padStart(2,'0')}</span><div class="grow">${id} · ${names(e.a)} / ${names(e.b)}<small>${e.work} 分钟作业 · ${e.cost} 万元</small></div><button class="small" data-move="${id}" data-dir="-1" aria-label="上移 ${id}" ${i===0?'disabled':''}>↑</button><button class="small" data-move="${id}" data-dir="1" aria-label="下移 ${id}" ${i===state.plan.length-1?'disabled':''}>↓</button><button class="small" data-remove="${id}" aria-label="移除 ${id}">×</button></li>`}).join('')||'<li class="hint">尚未添加道路，请点击地图中的红色路段。</li>'}</ol><div class="actions"><button data-action="recommend">生成参考顺序</button><button class="primary" data-nav="resources">前往抢修队伍派遣 →</button></div><details class="planning-explainer"><summary>参考顺序的依据</summary><p class="hint">参考方案按“新增可达人口＋重点设施权重 / 工期与投入”逐步选择，供比较学习，不保证全局最优。</p></details></div></section></aside></div>`;}
 function crewCards(){return state.crews.map(c=>`<div class="crew"><div class="crew-top"><b>${c.name}</b><span class="${c.job?'blue':'green'}">${c.job?'执行中':'待命'}</span></div>${c.job?`<small>${c.job.edge} · 预计 T+${c.job.end} 完成</small><progress value="${state.time-c.job.start}" max="${c.job.duration}"></progress>`:`<small>工种：${({road:'清障与道路修复',pump:'排涝抽排',bridge:'桥梁加固'})[c.type]}</small>`}</div>`).join('');}
 function resources(){const blocked=state.edges.filter(e=>!E.passable(state,e));return `<div class="workspace"><section class="panel"><div class="panel-head"><h2>抢修派遣台</h2><span class="tag">预算 ${state.budget-state.spent} 万元可用</span></div><div class="panel-body"><p class="hint">选择工种匹配的空闲队伍。至少一个作业端点须与基地连通；进场时间计入总工期。每次派遣即扣除该路段投入。</p></div><div class="table-wrap"><table><thead><tr><th>路段</th><th>状态</th><th>所需工种</th><th>作业时间 / 投入</th><th>派遣</th></tr></thead><tbody>${blocked.map(e=>{const type=E.requiredType(e);return `<tr><td><button class="small" data-road="${e.id}">${e.id}</button></td><td>${badge(E.status(state,e))}</td><td>${({road:'道路',pump:'排涝',bridge:'桥梁'})[type]}</td><td>${e.work} min / ${e.cost} 万元</td><td><select aria-label="${e.id} 派遣队伍" id="crew-${e.id}">${state.crews.filter(c=>c.type===type).map(c=>`<option value="${c.id}" ${state.crews.find(v=>v.type===type&&!E.canDispatch(state,e.id,v.id))?.id===c.id?'selected':''}>${c.name}${c.job?'（忙碌）':''}</option>`).join('')}</select> <button class="small" data-dispatch="${e.id}" ${state.ended||E.status(state,e)==='repair'?'disabled':''}>派遣</button></td></tr>`}).join('')||'<tr><td colspan="5">所有道路均可通行</td></tr>'}</tbody></table></div><div class="panel-body"><label class="inline-label"><input id="auto-plan" type="checkbox" ${state.auto?'checked':''} ${state.ended?'disabled':''}>按计划自动派遣（${state.plan.length} 条待执行）</label><div class="actions"><button class="primary" data-action="dispatch-fast" ${state.ended||!state.crews.some(c=>c.job)?'disabled':''}>完成派遣 · 4倍推演</button><button data-nav="simulate">进入仿真推演</button><button data-scroll="teaching-plan">调整抢通顺序 ↑</button></div></div></section><aside class="panel"><div class="panel-head"><h2>抢修力量</h2><small>4 支专业队伍</small></div><div class="panel-body">${crewCards()}<p class="hint">队伍完成任务后回到待命状态；下一任务进场统一从基地计算，属于教学简化。</p></div></aside></div>`;}
 function chart(){const ts=state.timeline,max=E.stats(state).pop;const pts=ts.map(t=>`${40+t.time/180*720},${135-t.available/max*110}`).join(' ');return `<svg class="chart" viewBox="0 0 800 165" role="img" aria-label="基地可达人口随实验时间变化"><line x1="40" y1="135" x2="760" y2="135" stroke="#405568"/><line x1="40" y1="25" x2="760" y2="25" stroke="#263e50" stroke-dasharray="5 5"/><text x="5" y="29" fill="#9aafbf" font-size="12">${max}</text><text x="18" y="138" fill="#9aafbf" font-size="12">0</text><polyline points="${pts}" fill="none" stroke="#43dfbf" stroke-width="3"/>${[0,30,60,90,120,150,180].map(t=>`<text x="${40+t/180*720}" y="157" fill="#9aafbf" font-size="12" text-anchor="middle">${t} min</text>`).join('')}</svg>`;}
@@ -50,11 +1260,30 @@ function settings(){const locked=!!(state.time||state.spent||state.learningBranc
 function records(){const list=experimentHistory();return `<section class="panel"><div class="panel-head"><h2>本机实验记录</h2><div class="actions"><button data-action="export">导出当前备份</button><button data-action="import">导入实验</button><button class="primary" data-action="archive">保存一条记录</button></div></div><div class="panel-body"><p class="hint">最多保存最近 20 次实验，仅当前浏览器可见。导出的 JSON 可用于迁移和继续实验；HTML 报告可用浏览器打印为 PDF。</p></div><div class="table-wrap"><table><thead><tr><th>保存时间</th><th>情景 / 姓名</th><th>进度</th><th>得分</th><th>操作</th></tr></thead><tbody>${list.map(r=>{try{const s=E.validate(r.state);return `<tr><td>${esc(r.date)}</td><td>${E.scenarios.find(v=>v.id===s.scenario).name}<br><span class="muted">${esc(s.student||'未署名')}</span></td><td>${s.time} min · ${s.ended?'已结束':'进行中'}</td><td>${s.assessment?.phase==='active'?'未交卷':E.score(s).total}</td><td><button class="small" data-restore="${Number(r.id)}">载入</button> <button class="small danger" data-delete="${Number(r.id)}">删除</button></td></tr>`}catch{return ''}}).join('')||'<tr><td colspan="5" class="empty">暂无历史实验。完成一次练习后在此保存、比较与复盘。</td></tr>'}</tbody></table></div></section>`;}
 function roadEditor(){const locked=state.time||state.spent||state.ended||state.learningBranch||state.challenge||state.learningConditionsLocked;return `<section class="panel spaced"><div class="panel-head"><h2>初始道路状态编辑</h2><small>更改后清空识别答案与待执行计划</small></div><div class="table-wrap"><table><thead><tr><th>路段</th><th>连接区域</th><th>积水深度（m）</th><th>结构损坏 / 清障阻断</th><th>操作</th></tr></thead><tbody>${state.edges.map(e=>`<tr><td>${e.id}</td><td>${names(e.a)} / ${names(e.b)}</td><td><input aria-label="${e.id} 初始积水" id="depth-${e.id}" type="number" min="0" max="2" step="0.01" value="${e.depth.toFixed(2)}" ${locked?'disabled':''}></td><td><input aria-label="${e.id} 结构阻断" type="checkbox" id="damage-${e.id}" ${e.damage?'checked':''} ${locked?'disabled':''}></td><td><button class="small" data-save-road="${e.id}" ${locked?'disabled':''}>应用</button></td></tr>`).join('')}</tbody></table></div></section>`;}
 function identificationWorkspace(){
- const scenario=E.scenarios.find(v=>v.id===state.scenario);
- return `<section class="teaching-brief"><span class="tag">${scenario.level}</span><div><b>${scenario.name}</b><p>${scenario.desc}</p></div></section>`+identify()+`<details class="teaching-road-details spaced" id="teaching-roads" ${teachingRoadsOpen?'open':''}><summary>道路状态与监测清单</summary><div class="panel-head"><span class="hint">查看各路段的积水、连接与通行状态</span><select id="road-filter" aria-label="道路状态筛选"><option value="all">全部道路</option>${Object.entries(statusNames).map(([k,v])=>`<option value="${k}" ${roadFilter===k?'selected':''}>${v}</option>`).join('')}</select></div>${roadTable()}</details>`;
+ const scenario=E.scenarios.find(v=>v.id===state.scenario),st=E.stats(state),locked=state.time||state.spent;
+ return `<section class="lab-taskbar"><div><span class="lab-step">实验 01</span><p>从基地 S 出发，找出无法通过道路连通的聚落。</p></div><button data-action="lesson-help">${navIcon('command-reports')}操作帮助</button>${locked?'<span class="lab-locked">本轮已开始推演，初始识别已锁定</span>':''}</section>`+identify()+`<div class="lab-secondary"><details class="panel lab-context"><summary>实验条件与灾情简报<span>${esc(scenario.name)}</span></summary><div class="panel-body"><h3>${esc(scenario.name)}</h3><p>${esc(scenario.desc)}</p><div class="lab-context-stats"><span>区域人口 <b>${st.pop} 人</b></span><span>实验时刻 <b>T+${state.time} / ${state.horizon} 分钟</b></span><span>剩余预算 <b>${state.budget-state.spent} 万元</b></span></div></div></details><details class="teaching-road-details panel" id="teaching-roads" ${teachingRoadsOpen?'open':''}><summary>道路状态与监测清单</summary><div class="panel-head"><span class="hint">各路段积水、连接与通行状态</span><select id="road-filter" aria-label="道路状态筛选"><option value="all">全部道路</option>${Object.entries(statusNames).map(([k,v])=>`<option value="${k}" ${roadFilter===k?'selected':''}>${v}</option>`).join('')}</select></div>${roadTable()}</details></div>`;
 }
 function planningWorkspace(){const cost=state.plan.reduce((n,id)=>n+state.edges.find(e=>e.id===id).cost,0),remaining=state.budget-state.spent;return `<section class="decision-budget"><div><small>剩余预算</small><b>${remaining} <span>万元</span></b></div><div><small>待执行计划投入</small><b>${cost} <span>万元</span></b></div><p>${cost>remaining?'当前计划超出剩余预算 '+(cost-remaining)+' 万元，请调整道路顺序或取舍。':'每条路的工期与费用不同；先比较连通收益，再决定把有限预算用在哪里。'}</p><button data-nav="compare">比较方案 →</button></section><div id="teaching-plan">${plan()}</div><div class="actions"><button class="primary" data-nav="resources">下一步：抢修队伍派遣 →</button></div>`;}
-function learningHome(){const st=E.stats(state),scenario=E.scenarios.find(s=>s.id===state.scenario);return `<section class="learning-hero course-hero"><div class="course-hero-copy"><span class="course-label">虚拟仿真实验 · 学生学习空间</span><h2>先作出判断，<br>再用实验验证。</h2><p>从一条道路的选择开始，学习在时间、预算与资源约束下作出有依据的决策。</p><div class="course-facts"><span><i></i>${esc(scenario.name)}</span><span>T+${state.time} 分钟</span><span>剩余预算 ${state.budget-state.spent} 万元</span></div><div class="actions"><button class="primary" data-nav="${StudentSupport.next()[0]}">${StudentSupport.next()[1]} →</button><button data-action="course-help">查看操作引导</button></div><div class="course-concept" aria-label="探究学习过程"><span>提出判断</span><i>→</i><span>亲自操作</span><i>→</i><span>对照证据</span></div></div><aside class="course-resume">${StudentSupport.card()}</aside></section><section class="course-section"><div class="course-section-heading"><div><span class="eyebrow">基础实验</span><h2>按这条路线，完成一次学习</h2></div><span class="hint">可以随时暂停、保存，再继续</span></div><div class="learning-path course-path">${[['identify','01','观察与识别','判断哪些区域与基地断连',!!state.identification],['plan','02','制定计划','考虑费用、工期与进场条件',!!state.plan.length||state.spent>0],['resources','03','安排队伍','匹配工种与可用资源',state.spent>0],['simulate','04','推演验证','观察变化，必要时调整',state.time>0],['results','05','解释与复盘','依据结果说明取舍与改进',!!state.reflection.trim()]].map(([id,n,title,body,done])=>`<button data-nav="${id}"><span class="course-step-number">${n}</span><span><b>${title}</b><small>${body}</small><em>${done?'已有操作记录':'进入学习 →'}</em></span></button>`).join('')}</div></section><section class="course-section"><div class="course-section-heading"><div><span class="eyebrow">进一步探究</span><h2>换一种方式，检验你的想法</h2></div><button data-nav="results" class="subtle">查看四维评价 →</button></div><div class="course-experiments">${[['plan','01','先预测，再验证','写下预计的人口与投入，再与实际结果对照。','记录预测'],['branch-lab','02','如果换一种选择','从同一决策点尝试另一条路线，比较证据。','进入分支复盘'],['challenge-lab','03','我来设计一道题','设置路况、预算与目标，让同学独立作答。','开始学生出题'],['command-duel','04','与同伴互设脚本','双方先自测，再交换脚本解决对方的任务。','进入双向对战']].map(([id,n,title,body,action])=>`<article class="panel course-experiment"><div class="course-experiment-number">${n}</div><h3>${title}</h3><p>${body}</p><button class="small" data-nav="${id}">${action} →</button></article>`).join('')}</div></section><div class="course-footnote"><span>当前基地可达 ${st.available} / ${st.pop} 人</span><span>真实地理背景 · 教学路网与灾情参数</span><a href="tutorial.html#video" target="_blank" rel="noopener">观看80秒操作演示 ↗</a></div>`;}
+function learningHome(){
+ const scenario=E.scenarios.find(v=>v.id===state.scenario),next=StudentSupport.next();
+ const steps=[['identify','孤岛识别','找出断连聚落',!!state.identification],['plan','预算规划','比较通道收益',!!state.plan.length||state.spent>0],['resources','队伍派遣','确认进场条件',state.spent>0],['simulate','动态推演','观察路网变化',state.time>0],['results','评价复盘','用证据解释决策',!!state.reflection.trim()]];
+ const done=steps.filter(x=>x[3]).length;
+ const lessons=[['classroom','01','课堂协作实验','共同观察，一起作出判断','组织者设置条件，同学识别、预测与派遣，在同一份报告中回看决策。','协作课堂','blue'],['real-lab','02','真实路网实验','把决策放回真实城市','进入徐州实际道路网络，观察积水、设施与通道的空间关系。','空间探索','teal'],['branch-lab','03','分支复盘','换一种选择，验证不同结果','保留关键决策时刻，以同样的初始条件比较两种抢通方案。','对照研究','orange'],['command-duel','04','同伴脚本对战','从解决问题，到设计问题','双方设置情景、交换任务，用彼此的方案检验脚本与处置思路。','同伴探究','purple']];
+ return `<nav class="course-top-nav" aria-label="课程快捷导航"><span aria-current="page">课程首页</span><button data-nav="classroom">课堂实验</button><button data-nav="records">学习记录</button><a href="tutorial.html">学习指南 ↗</a></nav>
+ <section class="course-hero"><img class="course-hero-photo" src="xuzhou-3d-preview.jpg?v=52" alt="徐州云龙湖实拍，湖岸建筑、音乐厅与城市天际线"><div class="course-hero-copy"><div class="course-eyebrow"><i></i>交通与防灾 · 虚拟仿真实验课程</div><h1>在真实城市中，<br>推演每一次决策。</h1><p>从一条受阻道路出发，理解城市连通、资源约束与抢通顺序。先作判断，再用实验检验。</p><div class="course-hero-actions"><button class="primary" data-nav="classroom">进入课堂实验 <span>→</span></button><button data-nav="real-lab">探索实景路网 ↗</button></div><div class="course-hero-topics"><span>孤岛识别</span><span>动态规划</span><span>同伴探究</span></div></div><span class="course-location">江苏 · 徐州云龙湖 <small>真实城市 / 教学情景</small></span></section>
+ <div class="course-photo-credit">实拍摄影：<a href="https://commons.wikimedia.org/wiki/File:20260722_Yunlong_Lake_Xuzhou_05.jpg" target="_blank" rel="noopener">祝鱼贵 / Wikimedia Commons</a> · <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener">CC BY-SA 4.0</a> · 原图未修改，页面裁切展示</div>
+ <section class="course-orientation" aria-label="学习方式"><div><span class="orientation-number">01</span><div><b>读懂空间</b><small>地图、路况与设施关系</small></div></div><div><span class="orientation-number">02</span><div><b>验证决策</b><small>预算、工期与可达性变化</small></div></div><div><span class="orientation-number">03</span><div><b>解释结果</b><small>预测对照与过程证据</small></div></div><a href="tutorial.html">第一次使用？<b>查看学习指南 →</b></a></section>
+ <details class="course-catalog course-disclosure"><summary><span>选择其他学习方式<small>实景探索、分支复盘与同伴挑战</small></span><b>展开 ＋</b></summary><div class="course-card-grid">${lessons.filter(item=>item[0]!=='classroom').map(([id,num,title,subtitle,description,label,color])=>`<article class="course-card is-${color}"><div class="course-card-top"><span class="course-card-label">${label}</span><span class="course-card-number">${num}</span></div><h3>${title}</h3><b>${subtitle}</b><p>${description}</p><button data-nav="${id}">进入实验 <span>↗</span></button></article>`).join('')}</div></details>
+ <details class="course-progress course-disclosure"><summary><span>个人基础练习<small>按环节进入，保留当前练习进度</small></span><b>展开 ＋</b></summary><div class="course-section-heading"><div><span>基础训练</span><h2>基础练习 · 循序渐进</h2></div><p>${esc(scenario.name)} · 已记录 ${done} / 5 个环节</p></div><div class="course-step-list">${steps.map(([id,title,description,recorded],i)=>`<button data-nav="${id}" class="${recorded?'is-complete':next[0]===id?'is-current':''}"><span>${recorded?'✓':String(i+1).padStart(2,'0')}</span><div><b>${title}</b><small>${description}</small></div><em>→</em></button>`).join('')}</div></details>
+ <div class="course-support-links"><a href="tutorial.html">图文与视频教程 ↗</a><a href="intro.html">项目与模型说明 ↗</a><button data-nav="records">本机实验记录 ↗</button></div>
+ <details class="portal-explore panel course-disclosure"><summary>完整课程目录<span>需要更多工具时展开</span></summary><div class="academy-all-tools">${navigationGroups.map(g=>`<section><h3>${g.title}</h3>${g.tabs.map(([id,title])=>`<button data-nav="${id}">${title} <span>↗</span></button>`).join('')}</section>`).join('')}</div></details>`;
+}
+
+function labJourney(){
+ const stages=[['identify','观察识别'],['plan','通道规划'],['resources','队伍派遣'],['simulate','动态推演'],['results','评价复盘']];
+ if(!stages.some(([id])=>id===page))return '';
+ return `<nav class="lab-journey" aria-label="基础实验步骤">${stages.map(([id,title],i)=>`<button data-nav="${id}" class="${id===page?'active':''}" ${id===page?'aria-current="step"':''}><span>0${i+1}</span>${title}<i>→</i></button>`).join('')}</nav>`;
+}
 let comparisonCache=null;
 function compareWorkspace(){
  if(state.assessment?.phase==='active')return '<section class="panel panel-body"><h2>当前正在决策考核</h2><p>完成考核后再使用方案比较，考核中保留独立决策过程。</p><button data-nav="assessment">返回考核</button></section>';
@@ -246,23 +1475,30 @@ const StudentSupport=(()=>{
 })();
 
 function render(){
- const roadsPanel=$('#teaching-roads');if(roadsPanel)teachingRoadsOpen=roadsPanel.open;
+ const roadsPanel=$('#teaching-roads');if(roadsPanel)teachingRoadsOpen=roadsPanel.open;const lessonPanel=$('#lesson-help');if(lessonPanel)lessonHelpOpen=lessonPanel.open;
  page=canonicalPage(page);FloodGeoScene.detach();document.body.dataset.page=page;
  const group=navigationGroup(page);document.body.dataset.workspace=group.id;
  if(routeView){const r=E.route(state,routeView.from,routeView.to);routeView={...(r||{error:true}),from:routeView.from,to:routeView.to};}
  $('#nav').innerHTML=sidebar();$('#nav').classList.toggle('is-open',mobileNavOpen);
- $('#page-title').textContent=group.tabs.find(t=>t[0]===page)[1];
+ $('#page-title').textContent=group.tabs.find(t=>t[0]===page)?.[1]||pages.find(t=>t[0]===page)?.[1]||'课堂工作区';
  $('#breadcrumb').textContent='交通孤岛决策实验 / '+group.title;
  $('#scenario').innerHTML=E.scenarios.map(v=>`<option value="${v.id}" ${v.id===state.scenario?'selected':''}>${v.name}</option>`).join('');
  $('#scenario').disabled=!!(state.learningBranch||state.challenge||state.learningConditionsLocked);
- metrics();const commandPage=FloodCommandUI.isPage(page);$('.experiment-controls').hidden=commandPage||['home','scene','records','branch-lab','challenge-lab'].includes(page);
+ metrics();const commandPage=FloodCommandUI.isPage(page);$('.experiment-controls').hidden=commandPage||['home','scene','real-lab','records','branch-lab','challenge-lab'].includes(page);
  let tabs=$('#workspace-tabs');if(!tabs){tabs=document.createElement('div');tabs.id='workspace-tabs';$('.topline').after(tabs);}tabs.innerHTML='';tabs.hidden=true;
- $('#content').innerHTML=commandPage?FloodCommandUI.view(page):({home:learningHome,compare:compareWorkspace,'branch-lab':()=>LearningStudio.branchPage(),'challenge-lab':()=>LearningStudio.challengePage(),scene,identify:identificationWorkspace,plan:planningWorkspace,resources:()=>'<div id="teaching-dispatch">'+resources()+'</div>',simulate,assessment:()=>(state.learningBranch||state.challenge)?'<section class="panel panel-body"><h2>当前为分支或学生挑战练习</h2><p>请按挑战目标和复盘理由完成学习；预置决策考核需要单独的预置情景。</p><button data-nav="settings">查看实验参数</button></section>':FloodAssessmentUI.view(),results,settings,records}[page])()+(page==='settings'?roadEditor():'');
- if(!commandPage)$('#content').insertAdjacentHTML('afterbegin',LearningStudio.banner()+(page==='home'?'':StudentSupport.card())+DecisionReviewUI.progress()+StudentPrediction.panel());
+ $('#content').innerHTML=page==='classroom'?FloodLearningUI.view():page==='real-lab'?FloodRealLab.view():commandPage?FloodCommandUI.view(page):({home:learningHome,compare:compareWorkspace,'branch-lab':()=>LearningStudio.branchPage(),'challenge-lab':()=>LearningStudio.challengePage(),scene,identify:identificationWorkspace,plan:planningWorkspace,resources:()=>'<div id="teaching-dispatch">'+resources()+'</div>',simulate,assessment:()=>(state.learningBranch||state.challenge)?'<section class="panel panel-body"><h2>当前为分支或学生挑战练习</h2><p>请按挑战目标和复盘理由完成学习；预置决策考核需要单独的预置情景。</p><button data-nav="settings">查看实验参数</button></section>':FloodAssessmentUI.view(),results,settings,records}[page])()+(page==='settings'?roadEditor():'');
+ if(!commandPage&&!['real-lab','classroom'].includes(page)){
+  $('#content').insertAdjacentHTML('afterbegin',LearningStudio.banner()+DecisionReviewUI.progress()+(page==='plan'?'':StudentPrediction.panel()));
+  if(page==='plan')$('#content').insertAdjacentHTML('beforeend',StudentPrediction.panel());
+  if(page!=='home'){const help=StudentSupport.card();if(help)$('#content').insertAdjacentHTML('beforeend',`<details class="panel lesson-help" id="lesson-help" ${lessonHelpOpen?'open':''}><summary>操作帮助与常用词<span>需要时展开阅读</span></summary>${help}</details>`);}
+ }
+ if(!commandPage&&!['real-lab','classroom'].includes(page))$('#content').insertAdjacentHTML('afterbegin',labJourney());
+ if(page==='classroom'){ $('#metrics').hidden=true;FloodLearningUI.mount();window.dispatchEvent(new Event('flood-view-updated'));return;}
  StudentSupport.decorate();
  if(commandPage)FloodCommandUI.decorate(page);else{FloodAssessmentUI.decorate();$('.header-actions [data-action="save"]').textContent='保存实验';}
- $('#metrics').hidden=!['command','identify','plan','resources','compare','simulate','assessment','command-review','command-replay','results'].includes(page);
- FloodGeoScene.mount({state,page,routeEdges:routeView?.edges||[],...(commandPage?{command:FloodCommandUI.commandState(page)}:{})});
+ $('#metrics').hidden=!['command','resources','compare','simulate','assessment','command-review','command-replay','results'].includes(page);
+ FloodGeoScene.mount({state,page,realLab:page==='real-lab',routeEdges:routeView?.edges||[],...(commandPage?{command:FloodCommandUI.commandState(page)}:{})});
+ FloodRealLab.bind(()=>{if(page==='real-lab')render();});
  window.dispatchEvent(new Event('flood-view-updated'));
 }
 
@@ -274,6 +1510,8 @@ function saveFields(){if($('#student'))state.student=$('#student').value;if($('#
 function report(){if(state.assessment){FloodAssessmentUI.report();return;}saveFields();const r=E.score(state);download('交通孤岛实验报告-'+state.scenario+'.html',DecisionReviewUI.reportHtml(r),'text/html;charset=utf-8');toast('报告已导出，包含四维评价、完成时间与计算证据');}
 const help=`<h2>交通孤岛与通道决策实验</h2><ol><li>孤岛识别：先判断哪些聚落与基地断连。</li><li>预算与通道规划：考虑各路费用、工期与连通收益。</li><li>方案比较：在同一条件上预演自定计划与规则参考，当前实验不会被改写。</li><li>抢修队伍派遣：匹配工种、进场道路和预算。</li><li>动态推演：推进时间，观察路况变化，再调整计划。</li><li>学习评价：查看成绩、完成复盘并导出报告。</li></ol><p>情景脚本、力量派遣、下达指令、问题作答、小组讨论分别位于左侧。协作实践与路网实验分别记录。</p><p class="hint">所有灾情、工期和费用为教学设定；规则参考不保证全局最优。记录保存在当前浏览器，重要进度请导出备份。</p>`;
 document.addEventListener('click',event=>{const b=event.target.closest('button,[data-road],[data-node]');if(!b)return;if(b.disabled)return;if(b.matches('[data-cmd],[data-command-task],[data-command-resource]'))return;if(!FloodCommandUI.isPage(page)&&FloodAssessmentUI.guard(b))return;const d=b.dataset;
+ if(d.action==='lesson-help'){const help=$('#lesson-help');if(help){help.open=true;help.querySelector('summary')?.focus({preventScroll:true});help.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion:reduce)').matches?'instant':'smooth',block:'start'});}return;}
+ if(d.action==='nav-focus'){const compact=document.body.classList.toggle('nav-compact');document.querySelectorAll('[data-action=nav-focus]').forEach(x=>{x.setAttribute('aria-label',compact?'展开课程目录':'收起课程目录');x.title=compact?'展开课程目录':'收起课程目录';});requestAnimationFrame(()=>FloodGeoScene.getMap()?.resize());return;}
  if(d.action==='menu-toggle'){mobileNavOpen=!mobileNavOpen;$('#nav').classList.toggle('is-open',mobileNavOpen);b.setAttribute('aria-expanded',String(mobileNavOpen));return;}
  if(d.scroll){$('#'+d.scroll)?.scrollIntoView({block:'start',behavior:'smooth'});return;}
  if(d.nav){saveFields();if(page==='simulate'&&d.nav!=='simulate')stop();navigate(d.nav);return;}
@@ -313,7 +1551,7 @@ document.addEventListener('click',event=>{const b=event.target.closest('button,[
  case 'export':saveFields();download('洪涝实验备份-'+state.scenario+'.json',JSON.stringify(state,null,2),'application/json');break;
  case 'import':$('#import-file').click();break;
  case 'report':report();break;
- case 'geo-sources':modal('<h2>徐州场景 · 数据与模型</h2><p>区域：徐州云龙湖湖滨及周边片区。底图道路、水体、地块与建筑轮廓来自 OpenStreetMap，经 OpenFreeMap/OpenMapTiles 整理。</p><p>建筑采用轮廓拉伸的三维体块；高度为开放数据中的近似值或默认示意值，不是实测楼高或倾斜摄影。</p><p>彩色任务通道为叠加的教学网络，医院、养老院、社区等标记为虚拟教学设施，不代表当地真实机构或灾害。</p><p>数据裁剪后随网站提供，无需地图密钥。地图底层道路未作为真实救援导航依据；长度、工期、人口、预算与通行阈值仍为教学设定。</p><p><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap / ODbL 版权与许可 ↗</a></p>');break;
+ case 'geo-sources':if(page==='real-lab'){modal('<h2>真实路网实验 · 数据与模型</h2><p>采用徐州云龙湖片区公开机动车道几何构建道路拓扑。灾情范围与道路相交时，路段随水深限行或阻断；路径与设施可达性同步重算。</p><p>道路来源 OpenStreetMap / OpenFreeMap；建筑轮廓真实，高度为开放数据近似值。设施用途、人口、雨强、灾情位置和作业参数为教学设定。</p><p>尚未接入地形高程或二维水动力计算，影响范围不是实际洪水淹没边界。单行、转向限制、信号灯和现场道路状态未建模，不用于实际导航。</p><p><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap / ODbL 版权与许可 ↗</a></p>');break;}modal('<h2>徐州场景 · 数据与模型</h2><p>区域：徐州云龙湖湖滨及周边片区。底图道路、水体、地块与建筑轮廓来自 OpenStreetMap，经 OpenFreeMap/OpenMapTiles 整理。</p><p>建筑采用轮廓拉伸的三维体块；高度为开放数据中的近似值或默认示意值，不是实测楼高或倾斜摄影。</p><p>彩色任务通道为叠加的教学网络，医院、养老院、社区等标记为虚拟教学设施，不代表当地真实机构或灾害。</p><p>数据裁剪后随网站提供，无需地图密钥。地图底层道路未作为真实救援导航依据；长度、工期、人口、预算与通行阈值仍为教学设定。</p><p><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap / ODbL 版权与许可 ↗</a></p>');break;
  case 'geo-topology':modal('<h2>教学路网拓扑</h2><p class="hint">用于分析节点连通性，与地图上的任务编号一致。</p>'+topologyMap());break;
  case 'zoom-in':zoom=Math.min(1.8,zoom+.2);render();break;
  case 'zoom-out':zoom=Math.max(.8,zoom-.2);render();break;

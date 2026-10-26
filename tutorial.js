@@ -29,14 +29,14 @@ window.FloodTutorial=(()=>{
   {title:'自己设计一道有目标的挑战题',page:'challenge-lab',target:()=>$('#studio-challenge-form')||$('#content'),text:()=>'先写学习目标，再设置预算、路况、道路费用和工期。检查题目并亲自试做后，可导出JSON让同学导入作答。',hint:'草稿独立保存，不会改变当前实验。参考未达标不能证明题目无解；挑战目标按指定时刻的真实推演记录检验。'},
   {title:'单独配置抢修队伍',page:'resources',target:()=>$('#teaching-dispatch'),text:()=>'这里专门处理教学道路抢修：检查工种、空闲队伍、预算与进场条件，再手动派遣或按计划自动派遣。',hint:'“协作实践 / 力量派遣”是另一份任务练习；道路抢修请使用当前页面。'},
   {title:'推进推演，观察道路变化',page:'simulate',target:()=>$('.simulation-toolbar'),text:()=>'用“推进 5 分钟”逐步观察，或开始自动推演。留意抢通完成时刻、受困人口和新增险情。',hint:'可暂停返回预算与通道规划调整方案。决策考核遇到关键问题会暂停，需先作答。'},
-  {title:'到教学成绩查看复盘',page:'results',target:()=>$('[data-action="report"]')||$('#content'),text:()=>'在“学习与决策 / 学习评价”查看四维分项、目标首次完成时间和计算依据。自动项85分，教师或同伴点评15分，点评前总评显示待完成。',hint:'教学成绩与协同演练报告分别记录。历史实验在“参数、考核与资料 / 实验记录”中保存或载入。'}
+  {title:'到教学成绩查看复盘',page:'results',target:()=>$('[data-action="report"]')||$('#content'),text:()=>'在“基础实验 / 学习评价”查看四维分项、目标首次完成时间和计算依据。自动项85分，教师或同伴点评15分，点评前总评显示待完成。',hint:'教学成绩与协同演练报告分别记录。历史实验在“参数、考核与资料 / 实验记录”中保存或载入。'}
  ];
  const steps=()=>active==='teaching'?teaching:exercise;
  function localPractice(){return FloodCommandUI.getMode()==='local'&&FloodCommandUI.getRole()==='director'&&state.assessment?.phase!=='active';}
  function open(){
   if(active)finish(false);
   const disabled=!localPractice();
-  window.modal(`<div class="tutorial-menu"><span class="tutorial-eyebrow">QUICK START / 新手教程</span><h2>先学会做一次通道决策</h2><p>第一次使用，建议先走教学实验导览；需要练习分工表达，再进入协作实践。</p><div class="tutorial-paths"><button data-tutorial="start" data-course="exercise" ${disabled?'disabled':''}><b>3分钟 · 第一次协作实践</b><span>选脚本 → 派遣 → 推进 → 反馈 → 报告 → 回放</span></button><button data-tutorial="start" data-course="teaching"><b>3分钟 · 交通孤岛实验导览 <small>推荐</small></b><span>了解识别、规划、分支复盘、学生出题与学习评价。</span></button></div>${disabled?'<p class="tutorial-note">协同跟做引导用于本机导调练习。当前在联机、其他角色或考核中，可先阅读手册或查看导览。</p>':''}<a class="tutorial-manual-link" href="tutorial.html" target="_blank" rel="noopener">打开完整文字教程 ↗</a> <a class="tutorial-manual-link" href="tutorial.html#video" target="_blank" rel="noopener">观看视频演示 ↗</a><p class="tutorial-note">可以随时退出引导，当前实验会保留。</p></div>`);
+  window.modal(`<div class="tutorial-menu"><span class="tutorial-eyebrow">QUICK START / 新手教程</span><h2>先学会做一次通道决策</h2><p>实景路网仿真：先预测T+30的断连人口，再播放灾情，派遣队伍并比较干预效果。基础拓扑练习可继续使用下方导览。</p><div class="actions"><button data-tutorial="real">进入实景路网仿真 →</button></div><div class="tutorial-paths"><button data-tutorial="start" data-course="exercise" ${disabled?'disabled':''}><b>3分钟 · 第一次协作实践</b><span>选脚本 → 派遣 → 推进 → 反馈 → 报告 → 回放</span></button><button data-tutorial="start" data-course="teaching"><b>3分钟 · 交通孤岛实验导览 <small>推荐</small></b><span>了解识别、规划、分支复盘、学生出题与学习评价。</span></button></div>${disabled?'<p class="tutorial-note">协同跟做引导用于本机导调练习。当前在联机、其他角色或考核中，可先阅读手册或查看导览。</p>':''}<a class="tutorial-manual-link" href="tutorial.html" target="_blank" rel="noopener">打开完整文字教程 ↗</a> <a class="tutorial-manual-link" href="tutorial.html#video" target="_blank" rel="noopener">观看视频演示 ↗</a><p class="tutorial-note">可以随时退出引导，当前实验会保留。</p></div>`);
  }
  function start(course){
   if(course==='exercise'&&!localPractice())return;
@@ -88,6 +88,7 @@ window.FloodTutorial=(()=>{
   const el=event.target.closest('[data-tutorial]');if(!el||el.disabled)return;
   switch(el.dataset.tutorial){
    case 'menu':remember();$('#tutorial-offer')?.remove();open();break;
+   case 'real':finish(false);$('#dialog').close();window.navigate('real-lab');break;
    case 'start':start(el.dataset.course);break;
    case 'dismiss':remember();$('#tutorial-offer')?.remove();break;
    case 'exit':finish(false);break;

@@ -1,90 +1,114 @@
 {
-  "region": "江苏省徐州市云龙湖东北岸及周边城区",
+  "region": "江苏省徐州市云龙湖及周边城区（扩展区域）",
   "bbox_wgs84": [
-    117.13,
-    34.23,
-    117.205,
-    34.29
+    117.08,
+    34.225,
+    117.26,
+    34.295
   ],
   "source_zoom": 14,
-  "retrieved_at_utc": "2026-10-17T07:40:01.668977+00:00",
+  "retrieved_at_utc": "2026-10-25T16:41:00.153470+00:00",
   "source": "OpenFreeMap public vector tiles derived from OpenStreetMap using the OpenMapTiles schema",
   "tilejson_url": "https://tiles.openfreemap.org/planet",
   "source_tile_urls": [
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6528.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6528.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6528.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6528.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6528.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6529.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6529.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6529.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6529.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6529.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6530.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6530.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6530.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6530.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6530.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6531.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6531.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6531.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6531.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6531.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13522/6532.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13523/6532.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13524/6532.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13525/6532.pbf",
-    "https://tiles.openfreemap.org/planet/20261011_080001_pt/14/13526/6532.pbf"
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13520/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13521/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13522/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13523/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13524/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13525/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13526/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13527/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13528/6528.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13520/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13521/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13522/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13523/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13524/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13525/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13526/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13527/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13528/6529.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13520/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13521/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13522/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13523/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13524/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13525/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13526/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13527/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13528/6530.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13520/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13521/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13522/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13523/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13524/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13525/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13526/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13527/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13528/6531.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13520/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13521/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13522/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13523/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13524/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13525/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13526/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13527/6532.pbf",
+    "https://tiles.openfreemap.org/planet/20261018_080001_pt/14/13528/6532.pbf"
   ],
   "counts": {
-    "buildings": 28,
-    "roads": 847,
-    "water": 67,
-    "landuse": 255,
-    "labels": 832
+    "buildings": 48,
+    "roads": 1375,
+    "water": 106,
+    "landuse": 441,
+    "labels": 1195
   },
-  "building_polygon_parts": 857,
+  "building_polygon_parts": 1132,
   "building_polygon_parts_by_render_height": {
-    "5": 839,
-    "30": 1,
+    "5": 1088,
     "11": 2,
-    "22": 6,
-    "60": 1,
-    "74": 1,
-    "110": 1,
+    "22": 23,
+    "26": 1,
+    "30": 1,
+    "33": 6,
     "35": 1,
+    "60": 1,
+    "66": 1,
+    "74": 1,
+    "96": 1,
     "100": 3,
-    "120": 1,
-    "26": 1
+    "110": 1,
+    "118": 1,
+    "120": 1
   },
   "near_views": [
     {
       "center": [
-        117.176451,
-        34.264271
+        117.165691,
+        34.262645
       ],
-      "polygon_parts_in_approx_300m_cell": 41,
+      "polygon_parts_in_approx_300m_cell": 43,
       "suggested_zoom": 16.7,
       "suggested_pitch": 58
     },
     {
       "center": [
-        117.18239,
-        34.252245
+        117.182763,
+        34.256636
       ],
-      "polygon_parts_in_approx_300m_cell": 34,
+      "polygon_parts_in_approx_300m_cell": 37,
       "suggested_zoom": 16.7,
       "suggested_pitch": 58
     }
   ],
   "skyline_view": {
     "center": [
-      117.179502,
-      34.270345
+      117.11205,
+      34.252808
     ],
-    "polygon_parts_in_approx_300m_cell": 24,
-    "parts_with_render_height_above_20m": 3,
+    "polygon_parts_in_approx_300m_cell": 12,
+    "parts_with_render_height_above_20m": 12,
     "suggested_zoom": 16.5,
     "suggested_pitch": 58
   },
@@ -105,5 +129,50 @@
     "water": "xuzhou-water.geojson",
     "landuse": "xuzhou-landuse.geojson",
     "labels": "xuzhou-labels.geojson"
+  },
+  "real_road_experiment": {
+    "version": 1,
+    "route": "#real-lab",
+    "model": "机动车道路几何拓扑；灾情范围与实际道路段相交产生限行/阻断，路网寻路与设施可达性同步计算。",
+    "teaching_parameters": "灾情位置、影响半径、积水增长、设施用途、人口、预算、工期与速度均为教学设定。",
+    "limits": "不含DEM或水动力求解；未建模单行、转向限制、信号灯、实时路况和救援队返回基地时间；非实际洪水淹没预测或导航服务。",
+    "network_snapshot": {
+      "vertices": 9188,
+      "roadSegments": 9107,
+      "components": 349,
+      "largestComponent": 6140,
+      "maxAccessMeters": 350,
+      "vehicleOnly": true,
+      "note": "根据本次扩展底图构建的机动车道路几何拓扑统计；不是经核实的实际道路条数。"
+    }
+  },
+  "visual_scene_details": {
+    "version": 47,
+    "footprints": "原始建筑轮廓与原有示意楼高保留。",
+    "illustrative": "窗面、屋顶配色、树木位置与高度、路面标线和投影为程序生成的教学外观，不是实景测绘成果。",
+    "routing": "外观细节不参与道路图、可达性、预算、抢修工期和积水计算。"
+  },
+  "ui_photography": {
+    "file": "xuzhou-3d-preview.jpg",
+    "title": "20260722 Yunlong Lake Xuzhou 05",
+    "author": "祝鱼贵",
+    "source_page": "https://commons.wikimedia.org/wiki/File:20260722_Yunlong_Lake_Xuzhou_05.jpg",
+    "original_url": "https://upload.wikimedia.org/wikipedia/commons/3/39/20260722_Yunlong_Lake_Xuzhou_05.jpg",
+    "date": "2026-07-22",
+    "license": "CC BY-SA 4.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+    "changes": "原始JPEG未修改；页面以object-fit裁切展示。兼容保留旧文件名，该文件现为云龙湖实拍照片，不再为三维渲染预览。"
+  },
+  "coverage_area_approx_km2": 129,
+  "coverage_area_note": "按经纬度矩形与中心纬度估算，仅用于说明底图覆盖范围；不等于教学任务或实际洪涝影响范围。",
+  "classroom_map": {
+    "version": "5.5",
+    "model": "xuzhou-road-network-v1",
+    "dataVersion": "922da47b6900b26c2ad4",
+    "coverage": "真实数据边界内按视口覆盖总览，动态限制缩放、拖动、旋转和58度俯仰；可拖动查看边缘，避免视口露出数据外。",
+    "routing": "12个教学地点固定接入主连通机动车路网，17处局部60米作业任务。按真实路段合并阻断和限行，重新计算可达性和实际进场路线。",
+    "display": "后端确认道路路径、距离和教学时间；冻结派遣路线用于地图移动和重启恢复；短场地接入段用虚线单独表达。",
+    "legacy": "旧拓扑实验与已结束报告保留原模型、时间和成绩，新建课堂默认采用真实道路模型。",
+    "limits": "双向道路、25km/h、限行减半和接入5km/h为教学规则；不模拟实际转向限制、实时交通、水动力或出发后的动态改道。"
   }
 }
