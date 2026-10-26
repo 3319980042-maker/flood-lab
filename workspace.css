@@ -698,3 +698,6 @@ body.classroom-map-open .shell>main{max-width:none;padding:6px 12px 8px}
 
 .lc-legacy-model{position:absolute;z-index:10;top:112px;left:90px;display:flex;align-items:center;gap:10px;max-width:calc(100% - 470px);padding:7px 10px;border:1px solid #d7c6a9;border-radius:4px;background:#fff8e5f2;color:#896b49;font-size:10px;line-height:1.6}.learning-shell .lc-legacy-model>button{min-height:25px;padding:3px 8px;font-size:10px;white-space:nowrap;background:#f4ead4}
 @media(max-width:760px){.lc-legacy-model{top:230px;left:8px;right:8px;max-width:none;align-items:start;flex-direction:column;gap:5px}}
+
+/* Hosting mode is stated beside the task, without covering the map. */
+.lc-mode-details{margin-top:20px;padding-top:16px;border-top:1px solid #cfdbdf;font-size:13px;line-height:1.8;color:#627984}.lc-mode-details summary{cursor:pointer;color:#335965}.lc-mode-summary{padding:14px 18px;border-left:3px solid #3a7c86;background:#edf5f5;color:#365963;line-height:1.8}.lc-access-choice>p{color:#627984;font-size:14px;line-height:1.8;margin:0 0 20px}

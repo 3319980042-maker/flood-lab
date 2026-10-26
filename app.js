@@ -1,77 +1,548 @@
-/* Source: frontend/classroom/api.js */
+/* Source: shared/learning-service.js */
+/* Shared classroom application rules. Runtime adapters inject storage, crypto and time. */
+(function(root,factory){
+  if(typeof module==='object'&&module.exports)module.exports=factory();
+  else root.FloodLearningService=factory();
+})(typeof globalThis!=='undefined'?globalThis:this,function(){
+  'use strict';
+  function create({engine:E,createStore,hash,randomToken,randomId,randomCode,now:clock=()=>new Date().toISOString(),routing=null}={}) {
+    if(!E||typeof createStore!=='function'||typeof hash!=='function'||typeof randomToken!=='function'||typeof randomId!=='function'||typeof randomCode!=='function')throw new Error('Classroom runtime adapters are required');
+const copy = x => JSON.parse(JSON.stringify(x));
+const MODEL = Object.freeze({ id: 'fixed-teaching-network-v1', name: '固定教学路网', scope: '12 个教学节点、17 条道路；不代表真实 OSM 路网或水动力模型。' });
+// Cache only immutable scenario metadata. Process restart after a source update
+// invalidates this catalog. Mutable experiment state and reports are never cached.
+const ACTION_FIELDS = {
+  configure: ['scenario', 'rain', 'budget'], start: [], dispatch: ['edgeId', 'crewId'],
+  advance: ['minutes'], advance_next: [], finish: [], predict: ['target', 'population', 'spent', 'reason'], identify: ['selected'], review: ['ratings', 'comment']
+};
+
+function fail(status, message, code = 'invalid_request') { const e = new Error(message); e.status = status; e.code = code; throw e; }
+function fields(body, allowed) {
+  if (!body || Array.isArray(body) || typeof body !== 'object' || Object.keys(body).some(k => !allowed.includes(k))) fail(400, '包含不允许的字段；请只提交操作，不要提交计算结果或身份。', 'invalid_fields');
+}
+function name(value, label = '姓名') {
+  if (typeof value !== 'string' || value.trim().length < 1 || value.trim().length > 40 || /[\u0000-\u001f\u007f]/.test(value)) fail(400, label + '需为 1–40 个字符。', 'invalid_name');
+  return value.trim();
+}
+function code(value) { if (typeof value !== 'string' || !/^\d{6}$/.test(value)) fail(400, '请输入六位实验码。', 'invalid_code'); return value; }
+function config(raw, fallback) {
+  const scenario = raw.scenario ?? fallback.scenario;
+  if (!E.scenarios.some(s => s.id === scenario)) fail(400, '教学情景不存在。', 'invalid_scenario');
+  const result = { scenario, rain: raw.rain ?? fallback.rain, budget: raw.budget ?? fallback.budget, horizon: 180 };
+  if (typeof result.rain !== 'number' || !Number.isFinite(result.rain) || result.rain < 0 || result.rain > 150 || typeof result.budget !== 'number' || !Number.isFinite(result.budget) || result.budget < 20 || result.budget > 200) fail(400, '降雨需为 0–150，预算需为 20–200。', 'invalid_config');
+  return result;
+}
+function newState(configuration, routing) {
+  const state = E.create(configuration.scenario);
+  const result = E.configure(state, configuration);
+  if (result.error) fail(400, result.error, 'invalid_config');
+  if(routing){state.routingModel=routing.modelId;state.routingDataVersion=routing.dataVersion;state.timeline=[];}
+  E.record(state);
+  return state;
+}
+function nextCompletionAt(state) {
+  const completions = state.crews.map(crew => crew.job?.end).filter(at => Number.isFinite(at) && at > state.time);
+  return completions.length ? Math.min(...completions) : null;
+}
+function validateRoom(room) {
+  if (!room || !/^\d{6}$/.test(room.code) || !Number.isInteger(room.version) || room.version < 1 || !['draft', 'running', 'finished'].includes(room.phase)) throw new Error('Invalid learning room');
+  name(room.title, '实验名称');
+  if (!Array.isArray(room.sessions) || room.sessions.length < 1 || room.sessions.length > 40 || room.sessions.filter(s => s.role === 'teacher').length !== 1 || new Set(room.sessions.map(s => s.hash)).size !== room.sessions.length) throw new Error('Invalid learning members');
+  for (const s of room.sessions) if (!/^[a-f0-9]{64}$/.test(s.hash) || !/^[a-f0-9]{16}$/.test(s.id) || !['teacher', 'student', 'observer'].includes(s.role) || !name(s.name)) throw new Error('Invalid learning member');
+  if (!Array.isArray(room.events) || room.events.length > 3000 || room.phase === 'finished' && !room.report) throw new Error('Invalid learning events');
+  config(room.config, room.config);
+  E.validate(room.state);
+  if (room.review !== undefined && room.review !== null) {
+    const r = room.review, saved = room.state.decisionReview;
+    if (room.phase !== 'finished' || !saved || !Number.isInteger(r.revision) || r.revision < 1 || !/^[a-f0-9]{16}$/.test(r.reviewerId) || !room.sessions.some(s => s.id === r.reviewerId && s.role === 'teacher') || !Number.isFinite(Date.parse(r.reviewedAt)) || r.reviewer !== saved.reviewer || r.comment !== saved.comment || JSON.stringify(r.ratings) !== JSON.stringify(saved.ratings)) throw new Error('Invalid learning review');
+  }
+}
+
+
+  if(routing)E.attachRoadRouting(routing);
+  const realModel = routing ? {id:routing.modelId,name:'真实道路课堂实验',scope:'12个教学地点、17处局部作业任务；沿已收录的真实机动车道路寻路，灾情、人口与速度为教学设定。',dataVersion:routing.dataVersion} : null;
+  const modelFor=state=>state.routingModel ? realModel : MODEL;
+  const catalog=JSON.stringify({model:realModel||MODEL,scenarios:E.scenarios.map(copy),roles:['teacher','student','observer']});
+  const store = createStore(validateRoom);
+
+  function authenticate(roomCode, token) {
+    code(roomCode);
+    if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) fail(401, '请先创建或加入课堂实验。', 'unauthorized');
+    const room = store.get(roomCode);
+    if (!room) fail(404, '课堂实验不存在。', 'not_found');
+    const member = room.sessions.find(s => s.hash === hash(token));
+    if (!member) fail(401, '教学会话凭据无效，请重新加入。', 'unauthorized');
+    return { room, member };
+  }
+  function issueSession(room, memberName, role) {
+    const token = randomToken();
+    const member = { id: randomId(), name: name(memberName), role, hash: hash(token), joinedAt: clock() };
+    room.sessions.push(member);
+    return { token, member };
+  }
+  function event(room, actor, type, text) {
+    if (room.events.length >= 2999) fail(409, '本轮操作记录已满，请结束实验后另开一轮。', 'event_limit');
+    room.events.push({ version: room.version, at: room.state.time, timestamp: clock(), type, actorId: actor.id, actorName: actor.name, role: actor.role, text });
+  }
+  function report(room) {
+    const stats = E.stats(room.state);
+    // Recompute from the server-owned initial road snapshot, with no active jobs.
+    // Timeline[0] may already include a dispatch and is not a reliable baseline.
+    const initialStats = E.stats({ ...room.state, edges: copy(room.state.initial.edges), crews: [], time: 0, spent: 0 });
+    return {
+      model: copy(modelFor(room.state)), title: room.title, config: copy(room.config), stats: { pop: stats.pop, available: stats.available, isolated: stats.isolated, blocked: stats.blocked, urgent: stats.urgent },
+      score: E.score(room.state), review: copy(room.review || null), timeline: copy(room.state.timeline), events: copy(room.events), logs: copy(room.state.logs), predictions: E.predictionResults(room.state),
+      identification: copy(room.state.identification || null), baseline: { available: initialStats.available, isolated: initialStats.isolated, spent: 0 },
+      time: room.state.time, spent: room.state.spent, finishedAt: room.finishedAt, version: room.version,
+      note: (room.state.routingModel ? '真实道路几何寻路与局部灾情教学规则评价；' : '旧固定拓扑教学规则评价；')+'自动部分满分85，人工评阅15分；未评阅时不计人工分。'
+    };
+  }
+  function projection(room, member) {
+    const stats = E.stats(room.state), running = room.phase === 'running';
+    const actor = ['teacher', 'student'].includes(member.role);
+    return {
+      code: room.code, id: room.code, title: room.title, phase: room.phase, version: room.version, role: member.role, memberId: member.id,
+      members: room.sessions.map(s => ({ id: s.id, name: s.name, role: s.role })), model: copy(modelFor(room.state)), config: copy(room.config),
+      stats: { pop: stats.pop, available: stats.available, isolated: stats.isolated, blocked: stats.blocked, urgent: stats.urgent }, score: room.report ? copy(room.report.score) : E.score(room.state), review: copy(room.review || null),
+      roads: room.state.edges.map(e => ({ ...copy(e), status: E.status(room.state, e), requiredType: E.requiredType(e), dispatchOptions: room.state.crews.map(c => {
+        const reason = !running ? '请先开始实验；结束后不能继续派遣。' : !actor ? '旁观者只能查看。' : E.canDispatch(room.state, e.id, c.id);
+        return { crewId: c.id, allowed: !reason, reason: reason || '', ...(!reason ? E.dispatchEstimate(room.state, e.id, c.id) : {}) };
+      }) })),
+      crews: copy(room.state.crews), nodes: E.nodes.map(n => ({ ...copy(n), reachable: stats.reachable.has(n.id) })), state: copy(room.state),
+      spatial: routing ? routing.scene(room.state) : null,
+      nextCompletionAt: nextCompletionAt(room.state), identification: copy(room.state.identification || null),
+      events: copy(room.events), predictions: E.predictionResults(room.state), report: room.report ? copy(room.report) : null,
+      createdAt: room.createdAt, updatedAt: room.updatedAt
+    };
+  }
+  return {
+    catalog: () => JSON.parse(catalog),
+    create(body) {
+      fields(body, ['name', 'title', 'scenario', 'rain', 'budget']);
+      if (store.size() >= 50) fail(409, '最多保留 50 个课堂实验。', 'room_limit');
+      const template = E.scenarios.find(s => s.id === (body.scenario ?? 'basic'));
+      if (!template) fail(400, '教学情景不存在。', 'invalid_scenario');
+      const configuration = config(body, { scenario: template.id, rain: template.rain, budget: template.budget });
+      let roomCode; do { roomCode = randomCode(); } while (store.has(roomCode));
+      const now = clock();
+      const room = { code: roomCode, title: name(body.title ?? '课堂路网实验', '实验名称'), phase: 'draft', version: 1, config: configuration, state: newState(configuration,routing), sessions: [], events: [], createdAt: now, updatedAt: now, finishedAt: null, report: null };
+      const { token, member } = issueSession(room, body.name, 'teacher');
+      event(room, member, 'create', '创建课堂实验，准备条件尚未锁定。');
+      return { ...projection(store.create(room), member), token };
+    },
+    join(body) {
+      fields(body, ['code', 'name', 'role']);
+      code(body.code); name(body.name);
+      if (!['student', 'observer'].includes(body.role)) fail(403, '加入者只能选择学生或旁观者；教师由创建者担任。', 'forbidden_role');
+      const current = store.get(body.code);
+      if (!current) fail(404, '课堂实验不存在。', 'not_found');
+      if (current.sessions.length >= 40) fail(409, '每轮最多 40 位成员。', 'member_limit');
+      if (current.phase === 'finished') fail(409, '实验已经结束；请使用原教学会话查看报告。', 'already_finished');
+      let credentials;
+      const room = store.change(body.code, candidate => {
+        credentials = issueSession(candidate, body.name, body.role); candidate.version++; candidate.updatedAt = clock();
+        event(candidate, credentials.member, 'join', '加入课堂实验。');
+      });
+      return { ...projection(room, credentials.member), token: credentials.token };
+    },
+    read(roomCode, token) { const { room, member } = authenticate(roomCode, token); return projection(room, member); },
+    findRoute(roomCode,token,query) {
+      const {room}=authenticate(roomCode,token);
+      fields(query,['from','to']);
+      if(!E.nodes.some(node=>node.id===query.from)||!E.nodes.some(node=>node.id===query.to)||query.from===query.to)fail(400,'请选择两个不同的教学地点。','invalid_endpoints');
+      if(!routing)fail(409,'当前服务未载入真实道路数据。','routing_unavailable');
+      return {version:room.version,from:query.from,to:query.to,route:copy(routing.route(room.state,query.from,query.to)),model:copy(realModel)};
+    },
+    readReport(roomCode, token) {
+      const { room } = authenticate(roomCode, token);
+      if (room.phase !== 'finished') fail(409, '请先结束实验，再查看本轮报告。', 'not_finished');
+      return copy(room.report);
+    },
+    action(roomCode, token, body) {
+      const { member } = authenticate(roomCode, token);
+      if (!body || typeof body.type !== 'string' || !Object.hasOwn(ACTION_FIELDS, body.type)) fail(400, '操作类型不存在。', 'invalid_action');
+      fields(body, ['version', 'type', ...ACTION_FIELDS[body.type]]);
+      if (!Number.isInteger(body.version) || body.version < 1) fail(400, '请提交刚读取的实验版本号。', 'invalid_version');
+      if (member.role === 'observer' || member.role === 'student' && !['dispatch', 'predict', 'identify'].includes(body.type)) fail(403, '当前角色无权执行此操作。', 'forbidden_role');
+      const room = store.change(roomCode, candidate => {
+        // Check and mutate inside the same synchronous storage transaction.
+        if (candidate.version !== body.version) fail(409, '实验已被其他成员更新，请刷新后再操作。', 'version_conflict');
+        if (body.type === 'review') {
+          if (candidate.phase !== 'finished') fail(409, '请先结束实验，再进行教师评阅。', 'not_finished');
+          if (candidate.report?.score?.scoringVersion !== 2 || !Number.isFinite(candidate.report.score.autoScore) || candidate.report.score.autoScore < 0 || candidate.report.score.autoScore > 85 || !Array.isArray(candidate.report.score.rows) || !candidate.report.score.rows.some(row => row.key === 'reasoning')) fail(409, '本轮报告采用旧评分格式，保留原成绩，不追加新版评阅。', 'review_unavailable');
+          fields(body.ratings, ['evidence', 'analysis', 'improvement']);
+          if (typeof body.comment !== 'string' || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(body.comment)) fail(400, '请提交 10–2000 字的评阅依据。', 'invalid_review');
+          const result = E.setDecisionReview(candidate.state, { ratings: body.ratings, comment: body.comment, reviewer: member.name });
+          if (result.error) fail(400, result.error, 'invalid_review');
+          candidate.version++; candidate.updatedAt = clock();
+          const review = candidate.state.decisionReview;
+          candidate.review = { ratings: copy(review.ratings), comment: review.comment, reviewer: member.name, reviewerId: member.id, reviewedAt: candidate.updatedAt, revision: (candidate.review?.revision || 0) + 1 };
+          event(candidate, member, 'review', `教师评阅第 ${candidate.review.revision} 次：依据与证据 ${review.ratings.evidence}/5，结果分析 ${review.ratings.analysis}/5，方案改进 ${review.ratings.improvement}/5。${review.comment}`);
+          const evaluated = E.score(candidate.state), previous = candidate.report.score;
+          // Automatic results are frozen when the experiment ends. A later code
+          // update or review must never silently recalculate that archived grade.
+          const total = Math.round((previous.autoScore + evaluated.manualScore) * 10) / 10;
+          candidate.report = { ...candidate.report, score: { ...previous, total, manualScore: evaluated.manualScore, manualPending: false, level: total >= 85 ? '优秀' : total >= 70 ? '良好' : total >= 60 ? '合格' : '需改进', rows: previous.rows.map(row => row.key === 'reasoning' ? evaluated.rows.find(current => current.key === 'reasoning') : row), suggestions: evaluated.suggestions }, review: copy(candidate.review), events: copy(candidate.events), version: candidate.version, note: '保持实验结束时的道路模型、结果与自动85分；人工评阅满分15，按三项量表计分。' };
+          return;
+        }
+        if (candidate.phase === 'finished') fail(409, '实验已经结束，结果与报告已锁定；教学组织者可补充或修订评阅。', 'already_finished');
+        const state = candidate.state;
+        let result, text;
+        if (body.type === 'configure') {
+          if (candidate.phase !== 'draft') fail(409, '开始后初始条件已锁定。', 'config_locked');
+          let fallback = candidate.config;
+          if (body.scenario !== undefined && body.scenario !== candidate.config.scenario) {
+            const scenario = E.scenarios.find(s => s.id === body.scenario);
+            if (!scenario) fail(400, '教学情景不存在。', 'invalid_scenario');
+            fallback = { scenario: scenario.id, rain: scenario.rain, budget: scenario.budget };
+          }
+          candidate.config = config(body, fallback); candidate.state = newState(candidate.config,candidate.state.routingModel?routing:null); text = '更新准备条件。';
+        } else if (body.type === 'start') {
+          if (candidate.phase !== 'draft') fail(409, '实验已经开始。', 'already_started');
+          candidate.phase = 'running'; candidate.state.learningConditionsLocked = true; text = '开始实验，锁定初始条件。';
+        } else {
+          if (candidate.phase !== 'running') fail(409, '请先开始实验。', 'not_started');
+          if (body.type === 'dispatch') {
+            if (typeof body.edgeId !== 'string' || typeof body.crewId !== 'string') fail(400, '请选择道路与队伍。', 'invalid_dispatch');
+            result = E.dispatch(state, body.edgeId, body.crewId); text = body.crewId + ' 派遣至 ' + body.edgeId + '。';
+          } else if (body.type === 'advance') {
+            if (!Number.isInteger(body.minutes) || body.minutes < 1 || body.minutes > 180) fail(400, '推进时间需为 1–180 分钟的整数。', 'invalid_minutes');
+            E.step(state, body.minutes); text = '推进 ' + body.minutes + ' 分钟，当前 T+' + state.time + '。';
+          } else if (body.type === 'advance_next') {
+            const completionAt = nextCompletionAt(state);
+            if (completionAt === null) fail(400, '当前没有正在进行的作业，请先派遣队伍。', 'no_pending_jobs');
+            const target = Math.min(completionAt, state.horizon);
+            E.step(state, target - state.time);
+            text = completionAt <= state.horizon ? '快进至下一项作业完成，当前 T+' + state.time + '。' : '快进至实验时限，当前 T+' + state.time + '；下一项作业预计 T+' + completionAt + ' 完成，超过本轮时限。';
+          } else if (body.type === 'predict') {
+            if (typeof body.target !== 'number' || typeof body.population !== 'number' || typeof body.spent !== 'number' || typeof body.reason !== 'string') fail(400, '预测需提交时刻、人口、投入和依据。', 'invalid_prediction');
+            result = E.addPrediction(state, body); text = '提交 T+' + body.target + ' 的预测，保留原始判断。';
+          } else if (body.type === 'identify') {
+            if (!Array.isArray(body.selected) || body.selected.length > E.nodes.length || body.selected.some(id => typeof id !== 'string' || !E.nodes.some(n => n.id === id && n.pop > 0))) fail(400, '识别答案应为教学节点编号数组。', 'invalid_identification');
+            result = E.identify(state, body.selected); text = '提交初始孤岛识别。';
+          } else if (body.type === 'finish') { state.ended = true; E.log(state, '教师结束实验。'); text = '结束实验，锁定报告。'; }
+        }
+        if (result?.error) fail(400, result.error, 'action_rejected');
+        candidate.version++; candidate.updatedAt = clock();
+        event(candidate, member, body.type, text);
+        if (candidate.state.ended) { candidate.phase = 'finished'; candidate.finishedAt = candidate.updatedAt; candidate.report = report(candidate); }
+      });
+      return projection(room, member);
+    }
+  };
+
+  }
+  return Object.freeze({create});
+});
+
+;
+/* Source: frontend/classroom/local-service.js */
 /*
- * 课堂前端 / 请求层
- * 输入：路径、操作数据、会话令牌。
- * 输出：服务返回的数据和不含令牌的请求记录。
- * 这里不读写网页、不保存课堂状态，也不计算实验结果。
+ * Browser runtime adapter for the shared classroom application.
+ * This is a single-browser teaching workspace, not a remote collaboration server.
+ * Its records and session credentials are separate from the server workspace.
+ */
+window.FloodClassroomLocalService = (() => {
+  'use strict';
+  const STORAGE_KEY = 'flood-classroom-local-service-v1';
+  const copy = value => JSON.parse(JSON.stringify(value));
+  const storageError = (message, cause) => {
+    const error = new Error(message, cause ? { cause } : undefined);
+    error.code = 'local_storage_unavailable'; error.status = 507;
+    return error;
+  };
+
+  // SHA-256 is synchronous because the shared transaction must finish before
+  // committing. The Node adapter continues to use node:crypto's SHA-256.
+  function sha256(value) {
+    const bytes = new TextEncoder().encode(value);
+    const size = Math.ceil((bytes.length + 9) / 64) * 64;
+    const padded = new Uint8Array(size); padded.set(bytes); padded[bytes.length] = 128;
+    const view = new DataView(padded.buffer);
+    const bitLength = bytes.length * 8;
+    view.setUint32(size - 8, Math.floor(bitLength / 4294967296));
+    view.setUint32(size - 4, bitLength >>> 0);
+    const constants = [
+      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    ];
+    const h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+    const words = new Uint32Array(64);
+    const rotate = (n, bits) => (n >>> bits) | (n << (32 - bits));
+    for (let offset = 0; offset < size; offset += 64) {
+      for (let i = 0; i < 16; i++) words[i] = view.getUint32(offset + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const a = words[i - 15], b = words[i - 2];
+        words[i] = (words[i - 16] + (rotate(a,7)^rotate(a,18)^(a>>>3)) + words[i - 7] + (rotate(b,17)^rotate(b,19)^(b>>>10))) >>> 0;
+      }
+      let [a,b,c,d,e,f,g,q] = h;
+      for (let i = 0; i < 64; i++) {
+        const first = (q + (rotate(e,6)^rotate(e,11)^rotate(e,25)) + ((e&f)^((~e)&g)) + constants[i] + words[i]) >>> 0;
+        const second = ((rotate(a,2)^rotate(a,13)^rotate(a,22)) + ((a&b)^(a&c)^(b&c))) >>> 0;
+        q=g;g=f;f=e;e=(d+first)>>>0;d=c;c=b;b=a;a=(first+second)>>>0;
+      }
+      const round = [a,b,c,d,e,f,g,q];
+      for (let i = 0; i < 8; i++) h[i] = (h[i] + round[i]) >>> 0;
+    }
+    return h.map(n => n.toString(16).padStart(8,'0')).join('');
+  }
+
+  function secureBytes(length) {
+    if (!window.crypto?.getRandomValues) throw new Error('当前浏览器不支持随机会话，请更换较新的浏览器。');
+    return window.crypto.getRandomValues(new Uint8Array(length));
+  }
+  function token() {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const bytes = secureBytes(32); let result = '', bits = 0, value = 0;
+    for (const byte of bytes) {
+      value = (value << 8) | byte; bits += 8;
+      while (bits >= 6) { bits -= 6; result += alphabet[(value >>> bits) & 63]; }
+    }
+    if (bits) result += alphabet[(value << (6 - bits)) & 63];
+    return result;
+  }
+  function randomCode() {
+    const limit = Math.floor(4294967296 / 900000) * 900000;
+    let value;
+    do { value = new DataView(secureBytes(4).buffer).getUint32(0); } while (value >= limit);
+    return String(100000 + value % 900000);
+  }
+
+  function createStore(storage, key, validate) {
+    let rooms = new Map(), loadedRaw = null;
+    function load() {
+      let saved;
+      try { saved = storage.getItem(key); }
+      catch (cause) { throw storageError('浏览器禁止保存课堂实验，请允许此网站使用本地存储。', cause); }
+      if (saved === null) { rooms = new Map(); loadedRaw = null; return; }
+      try {
+        const data = JSON.parse(saved);
+        if (data.version !== 1 || !Array.isArray(data.rooms) || data.rooms.length > 50) throw new Error('Invalid learning store');
+        const next = new Map();
+        for (const room of data.rooms) {
+          validate(room);
+          if (next.has(room.code)) throw new Error('Duplicate learning code');
+          next.set(room.code, room);
+        }
+        rooms = next; loadedRaw = saved;
+      } catch (cause) {
+        throw storageError('当前浏览器课堂存档无法验证，原存档已保留，请勿清除浏览器数据。', cause);
+      }
+    }
+    function commit(candidate) {
+      const content = JSON.stringify({ version: 1, rooms: [...candidate.values()] });
+      if (new TextEncoder().encode(content).byteLength > 30 * 1024 * 1024) throw storageError('课堂存档已超过容量限制，请先导出报告。');
+      // localStorage.setItem is atomic: on quota/security failure both the old
+      // stored value and the published in-memory snapshot remain unchanged.
+      try {
+        // Web Locks serialize current browsers. This additional comparison
+        // rejects a changed snapshot in environments without that capability.
+        if (storage.getItem(key) !== loadedRaw) {
+          const error = new Error('实验已在另一个标签页更新，请刷新后重试。');
+          error.code = 'version_conflict'; error.status = 409; throw error;
+        }
+        storage.setItem(key, content);
+      } catch (cause) {
+        if (cause.code === 'version_conflict') throw cause;
+        throw storageError('课堂实验未保存：浏览器存储不可用或空间不足，本次操作未生效。', cause);
+      }
+      rooms = candidate; loadedRaw = content;
+    }
+    load();
+    return {
+      has(code) { load(); return rooms.has(code); },
+      get(code) { load(); return rooms.has(code) ? copy(rooms.get(code)) : null; },
+      size() { load(); return rooms.size; },
+      create(room) {
+        load(); validate(room);
+        if (rooms.has(room.code)) throw new Error('Duplicate learning code');
+        const next = new Map(rooms); next.set(room.code, copy(room)); commit(next);
+        return copy(room);
+      },
+      change(code, operation) {
+        load(); const current = rooms.get(code);
+        if (!current) return null;
+        const candidate = copy(current); operation(candidate); validate(candidate);
+        const next = new Map(rooms); next.set(code, candidate); commit(next);
+        return copy(candidate);
+      }
+    };
+  }
+
+  async function readiness({ timeoutMs = 15000 } = {}) {
+    const started = Date.now();
+    while (!(window.FloodLearningService && window.FloodLab && window.FloodClassroomNetwork && window.FloodRoadRouting && window.FloodGeography && window.FloodRoadDataVersion && window.FloodLocalGeoData?.roads?.features?.length)) {
+      if (Date.now() - started >= timeoutMs) {
+        const error = new Error('真实道路数据尚未载入完成，请刷新页面后重试。');
+        error.code = 'local_routing_unavailable'; error.status = 503;
+        throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return true;
+  }
+
+  function createClient({ storageKey = STORAGE_KEY, storage } = {}) {
+    let servicePromise;
+    function service() {
+      if (!servicePromise) servicePromise = readiness().then(() => {
+        let persistence;
+        try { persistence = storage || window.localStorage; }
+        catch (cause) { throw storageError('浏览器禁止保存课堂实验，请允许此网站使用本地存储。', cause); }
+        const routing = window.FloodClassroomNetwork.create({
+          router: window.FloodRoadRouting, points: window.FloodGeography.points,
+          nodes: window.FloodLab.nodes, edges: window.FloodLab.edges,
+          dataVersion: window.FloodRoadDataVersion
+        });
+        return window.FloodLearningService.create({
+          engine: window.FloodLab, routing,
+          createStore: validate => createStore(persistence, storageKey, validate),
+          hash: sha256, randomToken: token,
+          randomId: () => [...secureBytes(8)].map(n => n.toString(16).padStart(2,'0')).join(''),
+          randomCode, now: () => new Date().toISOString()
+        });
+      }).catch(error => { servicePromise = undefined; throw error; });
+      return servicePromise;
+    }
+    async function request({ path, method = 'GET', body, token: credential } = {}) {
+      const started = Date.now(); let status = 0, data;
+      const trace = () => ({ method, path: 'browser:/api/learning' + path, fields: body === undefined ? [] : Object.keys(body), status: status || '未完成', ms: Date.now()-started, version: data?.version, phase: data?.phase, mode: 'local' });
+      async function execute() {
+        const api = await service();
+        const url = new URL(path, 'https://classroom.invalid/api/learning/');
+        // Existing clients pass /sessions etc.; absolute endpoint paths are
+        // also accepted to simplify transport substitution, never fetched.
+        const pathname = url.pathname.replace(/^\/api\/learning(?=\/|$)/,'');
+        if (pathname === '/catalog' && method === 'GET') { status=200; return api.catalog(); }
+        if (pathname === '/sessions' && method === 'POST') { const result=api.create(body===undefined?undefined:copy(body));status=201;return result; }
+        if (pathname === '/join' && method === 'POST') { const result=api.join(body===undefined?undefined:copy(body));status=200;return result; }
+        const route = /^\/sessions\/(\d{6})(?:\/(actions|report|route))?$/.exec(pathname);
+        if (route) {
+          const [,code,operation] = route;
+          if (!operation && method === 'GET') { const result=api.read(code,credential);status=200;return result; }
+          if (operation==='route' && method==='GET') { const result=api.findRoute(code,credential,Object.fromEntries(url.searchParams));status=200;return result; }
+          if (operation==='report' && method==='GET') { const result=api.readReport(code,credential);status=200;return result; }
+          if (operation==='actions' && method==='POST') { const result=api.action(code,credential,body===undefined?undefined:copy(body));status=200;return result; }
+        }
+        const error=new Error('课堂实验接口不存在。');error.status=404;error.code='not_found';throw error;
+      }
+      try {
+        // Where supported, serialize transactions between same-origin tabs.
+        // This does not connect different browsers, computers or users.
+        if (window.navigator?.locks?.request) {
+          let granted = false;
+          try {
+            data = await window.navigator.locks.request('flood-classroom:' + storageKey, () => { granted=true; return execute(); });
+          } catch (error) {
+            // Some file:// contexts expose Locks but reject before granting.
+            // A transaction that has begun is never repeated automatically.
+            if (!granted && ['SecurityError','NotSupportedError'].includes(error.name)) data=await execute();
+            else throw error;
+          }
+        } else data = await execute();
+        return { data: copy(data), trace: trace() };
+      } catch (error) {
+        status = error.status || 500; error.trace = trace();
+        error.serviceUnavailable = status === 503;
+        throw error;
+      }
+    }
+    return Object.freeze({ request, ready: () => service().then(() => true), mode: 'local' });
+  }
+  return Object.freeze({ createClient, readiness, STORAGE_KEY });
+})();
+
+;
+/* Source: frontend/classroom/api.js */
+/* Classroom transport: choose once before loading any saved identity.
+ * A missing static-host API selects browser practice. A live server failure
+ * never replays an operation in a different experiment or storage location.
  */
 window.FloodClassroomAPI = (() => {
   'use strict';
-
   function createClient({ baseUrl = '/api/learning', timeoutMs = 8000 } = {}) {
-    async function request({ path, method = 'GET', body, token } = {}) {
+    let mode = null;
+    let initializing = null;
+    let local = null;
+    async function serverRequest({ path, method = 'GET', body, token } = {}) {
       const started = Date.now();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
       let status = 0;
       let data;
-
       try {
         const headers = {};
         if (body !== undefined) headers['Content-Type'] = 'application/json';
         if (token) headers.Authorization = 'Bearer ' + token;
-
         const response = await fetch(baseUrl + path, {
-          method,
-          headers,
+          method, headers,
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: controller.signal
         });
         status = response.status;
         const text = await response.text();
-
-        try {
-          data = JSON.parse(text);
-        } catch {
-          throw new Error('当前地址没有启动课堂后端，请使用下方的本地服务入口。');
+        try { data = JSON.parse(text); }
+        catch {
+          const error = new Error('当前地址没有可用的课堂服务。');
+          error.staticResponse = status === 404 || response.ok && /^\s*<!doctype|^\s*<html/i.test(text);
+          throw error;
         }
         if (!response.ok) {
           const error = new Error(data.message || '请求失败');
           error.code = data.error;
+          error.staticResponse = status === 404;
           throw error;
         }
         return { data, trace: trace() };
       } catch (original) {
         let error = original;
-        if (original.name === 'AbortError') {
-          error = new Error('服务响应超时，请重试；未确认的操作不会在前端自行执行。');
-        } else if (!status) {
-          error = new Error('未能连接课堂服务，请检查服务窗口是否仍在运行。');
-        }
-        error.serviceUnavailable = !status || status === 404;
+        if (original.name === 'AbortError') error = new Error('课堂服务响应超时，请重试；未确认的操作不会自行执行。');
+        else if (!status) error = new Error('未能连接课堂服务，请检查服务是否仍在运行。');
+        error.serviceUnavailable = !status || status === 404 || status >= 500;
         error.trace = trace();
         throw error;
-      } finally {
-        clearTimeout(timeout);
-      }
-
-      // 只记字段名，不记录姓名、表单值或会话令牌。
+      } finally { clearTimeout(timeout); }
       function trace() {
-        return {
-          method,
-          path: baseUrl + path,
-          fields: body === undefined ? [] : Object.keys(body),
-          status: status || '连接失败',
-          ms: Date.now() - started,
-          version: data?.version,
-          phase: data?.phase
-        };
+        return { method, path: baseUrl + path, fields: body === undefined ? [] : Object.keys(body),
+          status: status || '连接失败', ms: Date.now() - started, version: data?.version, phase: data?.phase };
       }
     }
-
-    return Object.freeze({ request });
+    async function useLocal() {
+      local = window.FloodClassroomLocalService.createClient();
+      mode = 'local';
+      await local.ready();
+      return { mode };
+    }
+    function initialize() {
+      if (mode) return Promise.resolve({ mode });
+      if (!initializing) initializing = (async () => {
+        if (location.protocol === 'file:' || /(?:^|\.)github\.io$/i.test(location.hostname)) return useLocal();
+        try {
+          const result = await serverRequest({ path: '/catalog' });
+          if (!Array.isArray(result.data?.scenarios) || !result.data?.model) {
+            throw new Error('课堂服务返回了无法识别的目录，请检查服务配置。');
+          }
+          mode = 'server';
+          return { mode };
+        } catch (error) {
+          if (error.staticResponse) return useLocal();
+          throw error;
+        }
+      })().catch(error => { initializing = null; throw error; });
+      return initializing;
+    }
+    async function request(operation) {
+      await initialize();
+      return mode === 'local' ? local.request(operation) : serverRequest(operation);
+    }
+    return Object.freeze({ request, initialize, get mode() { return mode; } });
   }
-
   return Object.freeze({ createClient });
 })();
 
@@ -117,11 +588,12 @@ window.FloodClassroomViews = (() => {
 
   function header(model) {
     const { snapshot: s, online, explain } = model;
+    const connectionLabel = model.transport === 'local' ? '单机实验 · 本浏览器保存' : online ? '课堂服务已连接' : '等待连接';
     const stageTitle = !s ? '开始一轮课堂实验' : ({ draft: '准备本轮任务', running: s.title, finished: '实验报告与学习复盘' })[s.phase];
-    if (s?.phase === 'running') return `<header class="lc-top lc-map-top"><div class="lc-heading"><h2>${esc(s.title)}</h2><span class="lc-map-session">实验进行中 · ${esc(s.code)} · ${esc(roles[s.role] || s.role)}</span></div><div class="lc-header-actions"><span class="lc-service ${online ? 'is-online' : ''}"><i></i>${online ? '已连接' : '等待连接'}</span><button data-learning="explain" aria-expanded="${Boolean(explain)}">课堂指南</button><button data-learning="refresh">刷新</button><button data-learning="disconnect">返回入口</button></div></header>`;
+    if (s?.phase === 'running') return `<header class="lc-top lc-map-top"><div class="lc-heading"><h2>${esc(s.title)}</h2><span class="lc-map-session">实验进行中 · ${esc(s.code)} · ${esc(model.transport === 'local' && s.role === 'teacher' ? '实验操作者' : roles[s.role] || s.role)}</span></div><div class="lc-header-actions"><span class="lc-service ${online ? 'is-online' : ''}"><i></i>${esc(connectionLabel)}</span><button data-learning="explain" aria-expanded="${Boolean(explain)}">课堂指南</button><button data-learning="refresh">刷新</button><button data-learning="disconnect">返回入口</button></div></header>`;
     return `<header class="lc-top">
       <div class="lc-heading"><span class="lc-kicker">交通孤岛 · 教学工作区</span><h2>${esc(stageTitle)}</h2></div>
-      <div class="lc-header-actions"><span class="lc-service ${online ? 'is-online' : ''}"><i></i>${online ? '课堂已连接' : '等待课堂连接'}</span>
+      <div class="lc-header-actions"><span class="lc-service ${online ? 'is-online' : ''}"><i></i>${esc(connectionLabel)}</span>
         <button data-learning="explain" aria-expanded="${Boolean(explain)}">${explain ? '收起指南' : '课堂指南'}</button><button data-nav="home">课程目录</button>
       </div>
     </header>${s ? `<div class="lc-stage"><ol class="lc-steps">${[['draft', '01', '设置'], ['running', '02', '实验'], ['finished', '03', '报告']].map(([phase, number, title]) => `<li class="${s.phase === phase ? 'current' : ''}" ${s.phase === phase ? 'aria-current="step"' : ''}><small>${number}</small>${title}</li>`).join('')}</ol>
@@ -134,34 +606,38 @@ window.FloodClassroomViews = (() => {
     return `<section class="lc-empty"><span class="lc-kicker">课堂工作区</span><h2>连接教学服务</h2><p>正在读取本轮课堂条件与实验记录。</p></section>`;
   }
 
-  function offlineView() {
+  function offlineView(model) {
+    if (model.transport === 'local') return `<section class="lc-empty"><span class="lc-kicker">单机实验</span><h2>实验暂时未能载入</h2><p>请查看上方具体原因，确认地图资源已载入且浏览器允许此网站保存实验。</p><p>原实验记录会保留，请勿清除网站存储。</p><div class="actions"><button class="primary" data-learning="retry">重新载入</button><button data-nav="home">返回课程首页</button></div></section>`;
     return `<section class="lc-empty"><span class="lc-kicker">本地启动</span><h2>先启动本地课堂服务</h2><p>课堂服务负责保存实验、检查预算与同步小组操作。</p>
       <ol><li>打开维护源码目录 <code>work/flood-lab</code>。</li><li>双击 <b>启动课堂框架.cmd</b>，提示就绪后可关闭启动窗口。</li><li>访问 <a href="http://127.0.0.1:8770/#classroom">http://127.0.0.1:8770/#classroom</a>。</li></ol>
-      <p class="hint">GitHub Pages 和本地HTML可继续使用原有离线实验；课堂工作区需要Node.js服务。</p><div class="actions"><button class="primary" data-learning="retry">重新连接</button><button data-nav="home">返回离线课程</button></div></section>`;
+      <p class="hint">当前页面正在连接多人课堂服务。独立练习也可通过GitHub Pages上的单机课堂完成。</p><div class="actions"><button class="primary" data-learning="retry">重新连接</button><button data-nav="home">返回离线课程</button></div></section>`;
   }
 
   function introduction(model) {
     const { catalog, busy, entry, createDraft: c = {}, joinDraft: j = {} } = model;
+    const local = model.transport === 'local';
     const options = (catalog?.scenarios || []).map(s => `<option value="${esc(s.id)}" ${s.id === c.scenario ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
-    const create = `<form id="learning-create" class="lc-card lc-entry-form"><div class="lc-section-title"><div><span class="lc-kicker">教学组织者 / 出题小组</span><h3>创建一轮课堂</h3><p>先选择情景，具体条件在准备区确认。</p></div><button type="button" data-learning-entry="">返回</button></div><label class="field">你的姓名 / 小组<input name="name" maxlength="40" value="${esc(c.name)}" required></label><label class="field">实验名称<input name="title" maxlength="40" value="${esc(c.title)}" required></label><label class="field">实验情景<select name="scenario">${options}</select></label><input type="hidden" name="budget" value="${esc(c.budget)}"><input type="hidden" name="rain" value="${esc(c.rain)}"><button type="submit" class="primary lc-wide" ${busy ? 'disabled' : ''}>创建，进入准备区 ${icon('arrow')}</button></form>`;
+    const create = `<form id="learning-create" class="lc-card lc-entry-form"><div class="lc-section-title"><div><span class="lc-kicker">${local ? '单机练习 · 独立完成' : '教学组织者 / 出题小组'}</span><h3>${local ? '开始一轮实验' : '创建一轮课堂'}</h3><p>先选择情景，具体条件在准备区确认。</p></div><button type="button" data-learning-entry="">返回</button></div><label class="field">你的姓名 / 小组<input name="name" maxlength="40" value="${esc(c.name)}" required></label><label class="field">实验名称<input name="title" maxlength="40" value="${esc(c.title)}" required></label><label class="field">实验情景<select name="scenario">${options}</select></label><input type="hidden" name="budget" value="${esc(c.budget)}"><input type="hidden" name="rain" value="${esc(c.rain)}"><button type="submit" class="primary lc-wide" ${busy ? 'disabled' : ''}>创建，进入准备区 ${icon('arrow')}</button></form>`;
     const join = `<form id="learning-join" class="lc-card lc-entry-form"><div class="lc-section-title"><div><span class="lc-kicker">学生 / 观察者</span><h3>按实验码加入</h3><p>使用组织者分享的六位实验码。</p></div><button type="button" data-learning-entry="">返回</button></div><label class="field">实验码<input name="code" value="${esc(j.code)}" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" placeholder="六位实验码"></label><label class="field">姓名 / 小组<input name="name" value="${esc(j.name)}" required maxlength="40" placeholder="例如：第一小组"></label><label class="field">课堂职责<select name="role"><option value="student" ${j.role === 'student' ? 'selected' : ''}>学生：分析与派遣</option><option value="observer" ${j.role === 'observer' ? 'selected' : ''}>观察者：只读查看</option></select></label><button type="submit" class="primary lc-wide" ${busy ? 'disabled' : ''}>加入课堂 ${icon('arrow')}</button></form>`;
-    return `<section class="lc-access"><div class="lc-access-context"><span class="lc-kicker">准备 → 地图实验 → 学习报告</span><h2>进入你的课堂</h2><p>每次只处理当前阶段的任务。条件在准备区设置，识别、预测和派遣在地图中完成。</p><figure class="lc-entry-photo"><img src="xuzhou-3d-preview.jpg?v=53" alt="徐州云龙湖城市湖岸实拍"><figcaption>摄影：<a href="https://commons.wikimedia.org/wiki/File:20260722_Yunlong_Lake_Xuzhou_05.jpg" target="_blank" rel="noopener">祝鱼贵</a> · <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener">CC BY-SA 4.0</a> · 裁切展示</figcaption></figure><details class="lc-access-note"><summary>本轮教学模型说明</summary><p>真实道路课堂：12个教学地点、17处局部作业任务；道路来自公开地图，人口、灾情与费用为教学设定。</p><button data-nav="real-lab">进入独立真实路网实验 →</button></details></div><div class="lc-access-main">${entry === 'create' ? create : entry === 'join' ? join : `<div class="lc-access-choice"><span class="lc-kicker">课堂接入</span><h3>这次怎样开始？</h3><button class="primary" data-learning-entry="join">${icon('users')}<span><b>加入课堂</b><small>我有组织者提供的实验码</small></span>${icon('arrow')}</button><button data-learning-entry="create">${icon('map')}<span><b>创建课堂</b><small>我要组织实验，或独立练习</small></span>${icon('arrow')}</button></div>`}${model.recentSessions?.length && !entry ? `<details class="lc-recent-sessions" open><summary>继续最近的课堂 <small>${model.recentSessions.length}</small></summary><div class="lc-recent-list">${model.recentSessions.map(item => `<button data-learning-resume="${esc(item.code)}" ${busy ? 'disabled' : ''}><span>${esc(item.title || '课堂实验')}</span><small>${esc(item.code)} · ${esc(roles[item.role] || '课堂成员')} · ${{draft:'待开始',running:'进行中',finished:'已结束'}[item.phase] || '已保存'}</small><b>${item.phase === 'finished' ? '报告' : '继续'} →</b></button>`).join('')}</div><p>本浏览器保留原课堂身份。</p></details>` : ''}</div></section>`;
+    const choices = local
+      ? `<div class="lc-access-choice"><span class="lc-kicker">在线即可开始 · 无需安装</span><h3>完成你的第一轮实验</h3><p>设置条件、观察真实路网，完成判断、派遣与报告。</p><button class="primary" data-learning-entry="create">${icon('map')}<span><b>开始单机实验</b><small>实验记录自动保存在当前浏览器</small></span>${icon('arrow')}</button><details class="lc-mode-details"><summary>需要与同伴一起实验？</summary><p>当前是单机练习，实验编号不能跨设备加入。多人课堂需由学校或组织者提供课堂服务地址；本机已启动服务时，可使用 <a href="http://127.0.0.1:8770/#classroom">本地课堂入口 ↗</a>。</p></details></div>`
+      : `<div class="lc-access-choice"><span class="lc-kicker">课堂接入</span><h3>这次怎样开始？</h3><button class="primary" data-learning-entry="join">${icon('users')}<span><b>加入课堂</b><small>我有组织者提供的实验码</small></span>${icon('arrow')}</button><button data-learning-entry="create">${icon('map')}<span><b>创建课堂</b><small>我要组织实验，或独立练习</small></span>${icon('arrow')}</button></div>`;
+    return `<section class="lc-access"><div class="lc-access-context"><span class="lc-kicker">准备 → 地图实验 → 学习报告</span><h2>${local ? '把课堂搬进真实城市' : '进入你的课堂'}</h2><p>每次只处理当前阶段的任务。条件在准备区设置，识别、预测和派遣在地图中完成。</p><figure class="lc-entry-photo"><img src="xuzhou-3d-preview.jpg?v=56" alt="徐州云龙湖城市湖岸实拍"><figcaption>摄影：<a href="https://commons.wikimedia.org/wiki/File:20260722_Yunlong_Lake_Xuzhou_05.jpg" target="_blank" rel="noopener">祝鱼贵</a> · <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener">CC BY-SA 4.0</a> · 裁切展示</figcaption></figure><details class="lc-access-note"><summary>本轮教学模型说明</summary><p>真实道路课堂：12个教学地点、17处局部作业任务；道路来自公开地图，人口、灾情与费用为教学设定。</p><button data-nav="real-lab">进入独立真实路网实验 →</button></details></div><div class="lc-access-main">${entry === 'create' ? create : entry === 'join' && !local ? join : choices}${model.recentSessions?.length && !entry ? `<details class="lc-recent-sessions" open><summary>继续最近的实验 <small>${model.recentSessions.length}</small></summary><div class="lc-recent-list">${model.recentSessions.map(item => `<button data-learning-resume="${esc(item.code)}" ${busy ? 'disabled' : ''}><span>${esc(item.title || '课堂实验')}</span><small>${esc(item.code)} · ${local ? '本浏览器记录' : esc(roles[item.role] || '课堂成员')} · ${{draft:'待开始',running:'进行中',finished:'已结束'}[item.phase] || '已保存'}</small><b>${item.phase === 'finished' ? '报告' : '继续'} →</b></button>`).join('')}</div><p>${local ? '记录仅保存在此浏览器，清理浏览器数据会移除记录。结束后可导出报告。' : '本浏览器保留原课堂身份。'}</p></details>` : ''}</div></section>`;
   }
-
-
   function membersView(members) {
     return `<ul class="lc-member-list">${members.map(member => `<li><span class="lc-member-avatar">${esc(member.name?.slice(0, 1) || '组')}</span><div><b>${esc(member.name)}</b><small>${esc(roles[member.role] || member.role)}</small></div><span class="lc-member-online">已加入</span></li>`).join('')}</ul>`;
   }
 
   function preparation(model) {
     const { snapshot: s, catalog, busy, preparation: tab = 'task' } = model;
+    const local = model.transport === 'local';
     const locked = s.role !== 'teacher';
     const config = model.configDraft || s.config;
     const scenario = catalog.scenarios.find(v => v.id === s.config.scenario);
     const task = `<section class="lc-task-sheet lc-card"><span class="lc-kicker">本轮任务书</span><h2>有限预算下，怎样恢复更多连通？</h2><p>先找出与基地失去联系的聚落，记录预测；进入地图后选择受阻道路与队伍，观察行动造成的变化。</p><div class="lc-task-baseline"><div><small>初始可达人口</small><strong>${s.stats.available}<em>人</em></strong></div><div><small>初始断连人口</small><strong>${s.stats.isolated}<em>人</em></strong></div><div><small>仿真时限</small><strong>${s.config.horizon || 180}<em>分钟</em></strong></div></div><details class="lc-task-detail"><summary>查看学习目标与模型范围</summary><ol class="lc-task-sequence"><li><span>1</span><div><b>观察与判断</b><p>根据路网连通关系判断初始孤岛。</p></div></li><li><span>2</span><div><b>预测与行动</b><p>权衡预算、工期与可达人口，选择抢通顺序。</p></div></li><li><span>3</span><div><b>对照与解释</b><p>比较预测与实际，用过程证据解释决策。</p></div></li></ol><div class="lc-model-brief"><b>${esc(s.model.name)}</b><p>${esc(s.model.scope)}</p></div></details></section>`;
     const settings = `<section class="lc-card"><div class="lc-section-title"><div><h3>本轮条件设置</h3><p>${locked ? '由教学组织者设置，你可以查看。' : '设置预算与雨强；开始后锁定。'}</p></div></div><form id="learning-config"><fieldset ${locked ? 'disabled' : ''}><div class="form-grid"><label class="field lc-full-field">实验情景<select name="scenario">${catalog.scenarios.map(v => `<option value="${esc(v.id)}" ${v.id === config.scenario ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}</select></label><label class="field">预算 / 万元<input name="budget" type="number" min="20" max="200" value="${esc(config.budget)}" required></label><label class="field">降雨 / mm/h<input name="rain" type="number" min="0" max="150" value="${esc(config.rain)}" required></label></div><button type="submit" ${busy ? 'disabled' : ''}>保存本轮条件</button></fieldset></form><p class="hint">切换准备页签会保留输入；开始时保存当前有效条件。</p></section>`;
-    const members = `<section class="lc-card lc-member-card"><div class="lc-section-title">${icon('users')}<div><h3>邀请与分工 · ${s.members.length} 人</h3><p>将实验码 <b>${esc(s.code)}</b> 分享给同伴，选择“加入课堂”。</p></div></div>${membersView(s.members)}<p class="hint">组织者负责设置、推进时间和评阅；学生负责判断与派遣；观察者只读查看。</p></section>`;
-    return `<section class="lc-preparation"><nav class="lc-section-tabs" aria-label="实验准备"><button data-learning-preparation="task" class="${tab === 'task' ? 'is-active' : ''}" aria-pressed="${tab === 'task'}">任务说明</button><button data-learning-preparation="settings" class="${tab === 'settings' ? 'is-active' : ''}" aria-pressed="${tab === 'settings'}">条件设置</button><button data-learning-preparation="members" class="${tab === 'members' ? 'is-active' : ''}" aria-pressed="${tab === 'members'}">成员与分工 <small>${s.members.length}</small></button></nav><div id="lc-preparation-content" tabindex="-1">${tab === 'settings' ? settings : tab === 'members' ? members : task}</div><div class="lc-start"><div><b>${locked ? '等待组织者开始' : '准备好后，进入地图实验'}</b><p>已保存：${esc(scenario?.name || s.config.scenario)} · 预算 ${s.config.budget} 万元 · 降雨 ${s.config.rain} mm/h</p></div><button class="primary" data-learning="start" ${locked || busy ? 'disabled' : ''}>开始实验 ${icon('arrow')}</button></div></section>`;
+    const members = `<section class="lc-card lc-member-card"><div class="lc-section-title">${icon('users')}<div><h3>${local ? '练习安排' : '邀请与分工 · ' + s.members.length + ' 人'}</h3><p>${local ? '当前为单机练习，由你设置条件、完成判断并推进时间；实验编号仅用于本浏览器记录。' : '将实验码 <b>' + esc(s.code) + '</b> 分享给同伴，选择“加入课堂”。'}</p></div></div>${membersView(s.members)}<p class="hint">${local ? '由你独立完成设置、判断、派遣、时间推进与反思自评。单机实验不支持跨设备成员同步。' : '组织者负责设置、推进时间和评阅；学生负责判断与派遣；观察者只读查看。'}</p></section>`;
+    return `<section class="lc-preparation"><nav class="lc-section-tabs" aria-label="实验准备"><button data-learning-preparation="task" class="${tab === 'task' ? 'is-active' : ''}" aria-pressed="${tab === 'task'}">任务说明</button><button data-learning-preparation="settings" class="${tab === 'settings' ? 'is-active' : ''}" aria-pressed="${tab === 'settings'}">条件设置</button><button data-learning-preparation="members" class="${tab === 'members' ? 'is-active' : ''}" aria-pressed="${tab === 'members'}">${local ? '练习说明' : '成员与分工 <small>' + s.members.length + '</small>'}</button></nav><div id="lc-preparation-content" tabindex="-1">${tab === 'settings' ? settings : tab === 'members' ? members : task}</div><div class="lc-start"><div><b>${locked ? '等待组织者开始' : '准备好后，进入地图实验'}</b><p>已保存：${esc(scenario?.name || s.config.scenario)} · 预算 ${s.config.budget} 万元 · 降雨 ${s.config.rain} mm/h</p></div><button class="primary" data-learning="start" ${locked || busy ? 'disabled' : ''}>开始实验 ${icon('arrow')}</button></div></section>`;
   }
 
 
@@ -197,7 +673,7 @@ window.FloodClassroomViews = (() => {
     const {snapshot:s,routeDraft={from:'S',to:'C'},routeResult,busy}=model;
     const options=selected=>s.nodes.map(node=>`<option value="${esc(node.id)}" ${node.id===selected?'selected':''}>${esc(node.name)}</option>`).join('');
     const route=routeResult?.route;
-    return `${toolHeading('真实道路 / 两点查询','从哪里出发，到哪里去？','选择两个地点，按当前封路与限行状态计算道路路径。也可点击地图地点设置终点。')}<form id="learning-route-query"><label class="field">起点<select name="from">${options(routeDraft.from)}</select></label><label class="field">终点<select name="to">${options(routeDraft.to)}</select></label><button class="primary lc-wide" type="submit" ${busy?'disabled':''}>沿真实道路寻路</button></form>${routeResult?route?`<div class="lc-road-preview"><span>服务器确认的可通行路线</span><strong>${route.distanceKm}<small> 公里</small></strong><p>进场教学估计 ${route.minutes} 分钟；地图蓝线沿已收录道路行驶。</p><p>场地至道路接入口：起点 ${route.accessMeters.from} 米、终点 ${route.accessMeters.to} 米，以棕色虚线单独显示。</p><button data-learning="clear-route">清除查询路线</button></div>`:'<div class="lc-inline-notice">当前路况下没有可通行道路路径。请先处理阻断或选择其他地点。</div>':'<p class="hint">道路25km/h、限行减半、场地接入5km/h为教学规则；路况变化后需重新规划。无路时不绘制直线代替。</p>'}`;
+    return `${toolHeading('真实道路 / 两点查询','从哪里出发，到哪里去？','选择两个地点，按当前封路与限行状态计算道路路径。也可点击地图地点设置终点。')}<form id="learning-route-query"><label class="field">起点<select name="from">${options(routeDraft.from)}</select></label><label class="field">终点<select name="to">${options(routeDraft.to)}</select></label><button class="primary lc-wide" type="submit" ${busy?'disabled':''}>沿真实道路寻路</button></form>${routeResult?route?`<div class="lc-road-preview"><span>当前路况下的可通行路线</span><strong>${route.distanceKm}<small> 公里</small></strong><p>进场教学估计 ${route.minutes} 分钟；地图蓝线沿已收录道路行驶。</p><p>场地至道路接入口：起点 ${route.accessMeters.from} 米、终点 ${route.accessMeters.to} 米，以棕色虚线单独显示。</p><button data-learning="clear-route">清除查询路线</button></div>`:'<div class="lc-inline-notice">当前路况下没有可通行道路路径。请先处理阻断或选择其他地点。</div>':'<p class="hint">道路25km/h、限行减半、场地接入5km/h为教学规则；路况变化后需重新规划。无路时不绘制直线代替。</p>'}`;
   }
 
   function nodeNames(s, ids) {
@@ -318,11 +794,12 @@ window.FloodClassroomViews = (() => {
 
   function reviewView(model) {
     const { report: r, snapshot: s, busy, reviewDraft = {}, exporting } = model;
+    const local = model.transport === 'local';
     if (r.score.scoringVersion !== 2 || !Number.isFinite(r.score.autoScore)) return '<section class="lc-card lc-teacher-review"><h3>历史评阅记录</h3><p class="hint">本轮采用旧评分格式，保留原成绩，不追加新版15分评阅。</p></section>';
     const review = r.review;
     const completed = r.score.manualPending === false && r.score.manualScore != null;
     const rubric = [['evidence', '数据依据', '结合路况、人口与预测解释判断。'], ['analysis', '权衡分析', '说明预算、工期与抢通顺序的取舍。'], ['improvement', '反思改进', '根据结果提出具体的改进方案。']];
-    return `<section class="lc-card lc-teacher-review"><div class="lc-section-title">${icon('users')}<div><h3>决策解释与教师评阅</h3><p>自动指标评价决策成效，教师结合本组解释与过程进行点评。</p></div></div><div class="lc-report-total"><div><b>${completed ? '本轮总评已完成' : '等待教学组织者评阅'}</b><p>自动评价 ${Number(r.score.autoScore ?? 0).toFixed(1)} / 85 · 人工评阅 ${completed ? Number(r.score.manualScore).toFixed(1) : '待评'} / 15</p></div><strong>${completed ? Number(r.score.total).toFixed(1) + '<small> / 100</small>' : '<small>人工部分待评</small>'}</strong></div>${review ? `<div class="lc-review-state"><b>${esc(review.reviewer)} 的评语</b><p>${esc(review.comment)}</p><small>${rubric.map(([key, label]) => `${label} ${review.ratings[key]} / 5`).join(' · ')} · 第${review.revision}次评阅</small></div>` : `<p class="hint">${completed ? '这份历史记录未保存评语详情。' : '尚未提交人工评分；当前自动85分单独呈现。'}</p>`}${s.role === 'teacher' && !exporting ? `<form id="learning-review" class="lc-review-form"><h4>${review ? '修订本轮评阅' : '为本组提交评阅'}</h4><p>每项0–5分，合计15分；评语说明判断依据与改进建议。</p><div class="lc-review-rubric">${rubric.map(([key, label, description]) => `<label class="field"><span>${label}<small>${description}</small></span><select name="${key}" required ${busy ? 'disabled' : ''}><option value="">选择分数</option>${[0, 1, 2, 3, 4, 5].map(value => `<option value="${value}" ${String(reviewDraft[key]) === String(value) ? 'selected' : ''}>${value} / 5</option>`).join('')}</select></label>`).join('')}</div><label class="field">评语与改进建议<textarea name="comment" minlength="10" maxlength="2000" rows="3" placeholder="请结合预测、派遣顺序和实际结果，给出具体反馈。" required ${busy ? 'disabled' : ''}>${esc(reviewDraft.comment || '')}</textarea></label><div class="lc-form-footer"><span class="hint">保存后组内成员会看到最新评阅；不会重算已保存的自动成绩。</span><button type="submit" class="primary" ${busy ? 'disabled' : ''}>${review ? '保存修订' : '提交教师评阅'}</button></div></form>` : ''}</section>`;
+    return `<section class="lc-card lc-teacher-review"><div class="lc-section-title">${icon('users')}<div><h3>${model.transport === 'local' ? '决策解释与反思自评' : '决策解释与教师评阅'}</h3><p>${model.transport === 'local' ? '单机模式由你自评反思部分，分数用于练习，不作为教师已评阅的成绩。' : '自动指标评价决策成效，教师结合本组解释与过程进行点评。'}</p></div></div><div class="lc-report-total"><div><b>${completed ? '本轮总评已完成' : local ? '反思自评待完成' : '等待教学组织者评阅'}</b><p>自动评价 ${Number(r.score.autoScore ?? 0).toFixed(1)} / 85 · ${local ? '反思自评' : '人工评阅'} ${completed ? Number(r.score.manualScore).toFixed(1) : '待评'} / 15</p></div><strong>${completed ? Number(r.score.total).toFixed(1) + '<small> / 100</small>' : '<small>' + (local ? '反思自评待完成' : '人工部分待评') + '</small>'}</strong></div>${review ? `<div class="lc-review-state"><b>${esc(review.reviewer)} 的评语</b><p>${esc(review.comment)}</p><small>${rubric.map(([key, label]) => `${label} ${review.ratings[key]} / 5`).join(' · ')} · 第${review.revision}次评阅</small></div>` : `<p class="hint">${completed ? '这份历史记录未保存评语详情。' : '尚未提交人工评分；当前自动85分单独呈现。'}</p>`}${s.role === 'teacher' && !exporting ? `<form id="learning-review" class="lc-review-form"><h4>${review ? '修订本轮评阅' : local ? '记录你的反思与改进' : '为本组提交评阅'}</h4><p>每项0–5分，合计15分；评语说明判断依据与改进建议。</p><div class="lc-review-rubric">${rubric.map(([key, label, description]) => `<label class="field"><span>${label}<small>${description}</small></span><select name="${key}" required ${busy ? 'disabled' : ''}><option value="">选择分数</option>${[0, 1, 2, 3, 4, 5].map(value => `<option value="${value}" ${String(reviewDraft[key]) === String(value) ? 'selected' : ''}>${value} / 5</option>`).join('')}</select></label>`).join('')}</div><label class="field">评语与改进建议<textarea name="comment" minlength="10" maxlength="2000" rows="3" placeholder="请结合预测、派遣顺序和实际结果，给出具体反馈。" required ${busy ? 'disabled' : ''}>${esc(reviewDraft.comment || '')}</textarea></label><div class="lc-form-footer"><span class="hint">${local ? '自评仅用于本次练习，会与报告一起保存在当前浏览器；不会重算自动评价。' : '保存后组内成员会看到最新评阅；不会重算已保存的自动成绩。'}</span><button type="submit" class="primary" ${busy ? 'disabled' : ''}>${review ? '保存修订' : model.transport === 'local' ? '保存反思自评' : '提交教师评阅'}</button></div></form>` : ''}</section>`;
   }
 
   function reportView(model) {
@@ -331,10 +808,10 @@ window.FloodClassroomViews = (() => {
     const rows = (r.score.rows || []).filter(row => (row.key || row.id) !== 'reasoning');
     const tab = model.reportTab || 'summary';
     const show = id => exporting || tab === id;
-    const tabs = [['summary', '结果总览'], ['comparison', '判断对照'], ['process', '过程记录'], ['review', s.role === 'teacher' ? '教师评阅' : '评阅反馈']];
+    const tabs = [['summary', '结果总览'], ['comparison', '判断对照'], ['process', '过程记录'], ['review', model.transport === 'local' ? '反思自评' : s.role === 'teacher' ? '教师评阅' : '评阅反馈']];
     return `<section class="lc-report"><div class="lc-report-title"><div><span class="lc-kicker">本轮结果 / ${esc(s.code)}</span><h2>实验报告</h2><p>${esc(s.title)} · 仿真至T+${s.state.time}分钟</p></div><button class="primary" data-learning="export">导出完整报告</button></div>
       ${!exporting ? `<nav class="lc-section-tabs" aria-label="报告内容">${tabs.map(([id, label]) => `<button data-learning-report-tab="${id}" class="${tab === id ? 'is-active' : ''}" aria-pressed="${tab === id}">${label}${id === 'review' && r.score.manualPending !== false ? '<small>待评</small>' : ''}</button>`).join('')}</nav>` : ''}<div id="lc-report-content" tabindex="-1">
-      ${show('summary') ? `<div class="lc-report-metrics"><div><small>最终可达人口</small><strong>${r.stats.available}<em>人</em></strong>${r.baseline ? `<span>初始 ${r.baseline.available} 人</span>` : '<span>初始数据：本轮未记录</span>'}</div><div><small>仍然断连</small><strong>${r.stats.isolated}<em>人</em></strong>${r.baseline ? `<span>初始 ${r.baseline.isolated} 人</span>` : '<span>初始数据：本轮未记录</span>'}</div><div><small>实际投入</small><strong>${r.spent ?? s.state.spent}<em>万元</em></strong><span>预算 ${s.config.budget} 万元</span></div><div><small>${Number.isFinite(r.score.autoScore) ? '自动评价' : '历史记录成绩'}</small><strong>${Number.isFinite(r.score.autoScore) ? Number(r.score.autoScore).toFixed(1) + '<em> / 85</em>' : esc(r.score.total ?? '未记录')}</strong><span>${!Number.isFinite(r.score.autoScore) ? '旧格式保留' : r.score.manualPending === false ? '人工评阅已完成，可查看评阅反馈' : '人工评阅15分，尚未提交'}</span></div></div>${recoveryChart(r)}<section class="lc-card"><div class="lc-section-title"><div><h3>自动评价依据</h3><p>评价来自本轮保存的状态与过程。</p></div></div>${rows.map(row => `<div class="lc-score-row"><b>${esc(row.name || row.label || row.title || '评价分项')}</b><span>${row.score == null ? '待点评' : row.score} / ${row.max ?? row.full ?? '—'}</span><details><summary>查看评价依据</summary><p>${esc(row.reason || '本项暂无说明。')}</p></details></div>`).join('')}<p class="hint">自动部分满分85分；识别练习反馈单独展示。</p></section>` : ''}
+      ${show('summary') ? `<div class="lc-report-metrics"><div><small>最终可达人口</small><strong>${r.stats.available}<em>人</em></strong>${r.baseline ? `<span>初始 ${r.baseline.available} 人</span>` : '<span>初始数据：本轮未记录</span>'}</div><div><small>仍然断连</small><strong>${r.stats.isolated}<em>人</em></strong>${r.baseline ? `<span>初始 ${r.baseline.isolated} 人</span>` : '<span>初始数据：本轮未记录</span>'}</div><div><small>实际投入</small><strong>${r.spent ?? s.state.spent}<em>万元</em></strong><span>预算 ${s.config.budget} 万元</span></div><div><small>${Number.isFinite(r.score.autoScore) ? '自动评价' : '历史记录成绩'}</small><strong>${Number.isFinite(r.score.autoScore) ? Number(r.score.autoScore).toFixed(1) + '<em> / 85</em>' : esc(r.score.total ?? '未记录')}</strong><span>${!Number.isFinite(r.score.autoScore) ? '旧格式保留' : r.score.manualPending === false ? (model.transport === 'local' ? '反思自评已完成，可查看具体依据' : '人工评阅已完成，可查看评阅反馈') : (model.transport === 'local' ? '反思自评15分，尚未完成' : '人工评阅15分，尚未提交')}</span></div></div>${recoveryChart(r)}<section class="lc-card"><div class="lc-section-title"><div><h3>自动评价依据</h3><p>评价来自本轮保存的状态与过程。</p></div></div>${rows.map(row => `<div class="lc-score-row"><b>${esc(row.name || row.label || row.title || '评价分项')}</b><span>${row.score == null ? '待点评' : row.score} / ${row.max ?? row.full ?? '—'}</span><details><summary>查看评价依据</summary><p>${esc(row.reason || '本项暂无说明。')}</p></details></div>`).join('')}<p class="hint">自动部分满分85分；识别练习反馈单独展示。</p></section>` : ''}
       ${show('comparison') ? `<section class="lc-card lc-learning-review"><div class="lc-section-title">${icon('chart')}<div><h3>学习判断对照</h3><p>识别反馈和预测对照独立展示，帮助解释决策，不重复计入自动评分。</p></div></div><div class="lc-learning-comparison"><section><h4>最初，你如何判断孤岛？</h4>${identificationFeedback(s, r.identification, true)}</section><section><h4>推演前的预测，与实际一致吗？</h4>${predictionTable(r.predictions)}</section></div></section>` : ''}
       ${show('process') ? `<section class="lc-card"><div class="lc-section-title">${icon('list')}<div><h3>本轮过程记录</h3><p>查看成员分工、操作顺序与结果变化。</p></div></div>${eventsList(r.events)}<p class="hint">提前结束会保留未完成作业，不因快速结束获得完成奖励。</p></section>` : ''}
       ${show('review') ? reviewView(model) : ''}</div><div class="lc-report-footer"><span>报告与实验操作分开；导出始终包含所有报告内容。</span><button data-learning="disconnect">返回课堂入口 ${icon('arrow')}</button></div></section>`;
@@ -343,26 +820,31 @@ window.FloodClassroomViews = (() => {
 
   function explanation(model) {
     const role = model.snapshot?.role;
-    const guidance = role === 'observer' ? '你是观察者，可以查看地图、过程与报告；实验操作由小组其他成员完成。' : role === 'student' ? '你是学生，可以识别、预测和派遣；由教学组织者推进时间与结束实验。' : '教学组织者负责设置条件、邀请成员、推进时间与结束后的人工评阅；也可以独立完成一轮练习。';
-    const layers = [
+    const guidance = model.transport === 'local' ? '你可以独立设置条件、识别孤岛、记录预测、派遣队伍并推进时间，最后导出报告和填写反思自评。' : role === 'observer' ? '你是观察者，可以查看地图、过程与报告；实验操作由小组其他成员完成。' : role === 'student' ? '你是学生，可以识别、预测和派遣；由教学组织者推进时间与结束实验。' : '教学组织者负责设置条件、邀请成员、推进时间与结束后的人工评阅；也可以独立完成一轮练习。';
+    const layers = model.transport === 'local' ? [
+      ['前端界面', 'controller管理状态和按钮；views按状态显示，API选择单机运行适配。', 'frontend/classroom/controller.js · views.js · api.js'],
+      ['本机操作接口', '把创建、寻路和派遣等操作交给共享课堂业务，不发送给远程服务器。', 'frontend/classroom/local-service.js'],
+      ['共享业务与规则', '两种运行方式复用条件检查、真实道路寻路、成绩与报告规则。', 'shared/learning-service.js · engine.js · classroom-network.js'],
+      ['本浏览器保存', '保存成功才返回最新状态，刷新后读取同一份单机记录。', '浏览器localStorage，独立单机存档键']
+    ] : [
       ['前端界面', 'controller管理状态和按钮；views只按状态显示；api只发送请求。', 'frontend/classroom/controller.js · views.js · api.js'],
       ['通信接口', '识别教学会话、接收操作，并转交业务层。', 'backend/http/learning-routes.cjs'],
       ['业务处理', '检查权限、预算与进场，调用共享教学规则。', 'backend/application/learning-service.cjs + shared/engine.js'],
       ['数据保存', '写入成功才返回最新状态，报告读取这份记录。', 'backend/persistence/learning-store.cjs']
     ];
-    return `<section class="lc-explain lc-card"><div class="lc-section-title"><div><h3>一轮实验，怎样完成？</h3><p>${guidance}</p></div><button data-learning="explain">收起指南</button></div><div class="lc-guide-card"><b>观察地图 → 提交判断 → 行动验证 → 对照复盘</b><p>左侧选择工具或直接点选地图对象，按需打开操作面板；收起后继续观察地图。点击道路编号可查看费用与作业条件；滚轮拉近、右键拖动可观察建筑。</p><p>“两点寻路”先选起点与终点，蓝线为当前可行道路，棕色虚线是场地接入。初始孤岛判断须在派遣和推进前提交。预测须选未来时刻；作业完成后可用实际结果检验。返回入口仍会保留本浏览器中的恢复身份。</p></div><ol class="lc-task-sequence"><li><span>1</span><div><b>设置：先明确本轮条件</b><p>创建实验，设置预算与雨强；同伴输入六位实验码加入，组织者开始实验。</p></div></li><li><span>2</span><div><b>实验：用地图完成判断与行动</b><p>提交孤岛识别，写下预测；点选受阻道路，比较工种、费用与预计完成时刻，再派遣队伍。组织者推进或快进仿真。</p></div></li><li><span>3</span><div><b>报告：把判断和结果放在一起</b><p>结束后查看人口变化、预测对照和自动85分；组织者结合决策解释进行15分人工评阅，组内同步查看并可导出报告。</p></div></li></ol><details class="lc-architecture-details"><summary>想了解实现原理？跟着一次派遣看懂分层架构</summary><div class="lc-flow">${layers.map(([title, text, file], index) => `<div><span>0${index + 1}</span><b>${title}</b><p>${text}</p><code>${file}</code></div>`).join('')}</div>
-      <p>后端由 <code>backend/server.cjs</code> 组装接口、业务与存储。前端把明确的页面模型传给views，把令牌传给api；业务层不依赖网页。各层可在一个Node.js进程中运行。</p><h4>自己验证一次</h4><p>开始实验 → 提交初始孤岛判断 → 选择未来时刻并预测 → R3 / P1派遣 → 按后端估计快进至作业完成 → 查看原预测与实际对照 → 结束查看报告。</p><p class="hint">本工作区已接入真实道路两点查询、设置、识别、预测、派遣、推进和报告；独立实景实验等旧模块仍保留。实名账号、正式数据库和远程托管尚未建设。</p><details><summary>查看最近请求（不显示会话令牌）</summary><ol class="lc-traces">${(model.traces || []).map(trace => `<li><b>${esc(trace.method)}</b> <code>${esc(trace.path)}</code> · ${esc(trace.status)} · ${trace.ms}ms${trace.version !== undefined ? ' · 版本' + trace.version : ''}<small>提交字段：${esc(trace.fields.join('、') || '无')}；状态：${esc(trace.phase || '—')}</small></li>`).join('')}</ol></details></details></section>`;
+    return `<section class="lc-explain lc-card">${model.transport === 'local' ? '<p class="lc-mode-summary">当前为单机实验：设置、判断、派遣、时间推进与反思自评均由你完成；记录仅保存在本浏览器，不能用实验编号跨设备协作。</p>' : ''}<div class="lc-section-title"><div><h3>一轮实验，怎样完成？</h3><p>${guidance}</p></div><button data-learning="explain">收起指南</button></div><div class="lc-guide-card"><b>观察地图 → 提交判断 → 行动验证 → 对照复盘</b><p>左侧选择工具或直接点选地图对象，按需打开操作面板；收起后继续观察地图。点击道路编号可查看费用与作业条件；滚轮拉近、右键拖动可观察建筑。</p><p>“两点寻路”先选起点与终点，蓝线为当前可行道路，棕色虚线是场地接入。初始孤岛判断须在派遣和推进前提交。预测须选未来时刻；作业完成后可用实际结果检验。返回入口仍会保留本浏览器中的恢复身份。</p></div><ol class="lc-task-sequence"><li><span>1</span><div><b>设置：先明确本轮条件</b><p>${model.transport === 'local' ? '创建实验，设置预算与雨强，阅读任务后开始；记录保存在当前浏览器。' : '创建实验，设置预算与雨强；同伴输入六位实验码加入，组织者开始实验。'}</p></div></li><li><span>2</span><div><b>实验：用地图完成判断与行动</b><p>提交孤岛识别，写下预测；点选受阻道路，比较工种、费用与预计完成时刻，再派遣队伍。组织者推进或快进仿真。</p></div></li><li><span>3</span><div><b>报告：把判断和结果放在一起</b><p>${model.transport === 'local' ? '结束后查看人口变化、预测对照和自动85分，再填写15分反思自评；完整报告可以导出。' : '结束后查看人口变化、预测对照和自动85分；组织者结合决策解释进行15分人工评阅，组内同步查看并可导出报告。'}</p></div></li></ol><details class="lc-architecture-details"><summary>想了解实现原理？跟着一次派遣看懂分层架构</summary><div class="lc-flow">${layers.map(([title, text, file], index) => `<div><span>0${index + 1}</span><b>${title}</b><p>${text}</p><code>${file}</code></div>`).join('')}</div>
+      <p>${model.transport === 'local' ? '静态网站使用浏览器适配器运行共享业务与规则，记录保存在此浏览器；这不会创建多人服务器。接入Node.js课堂服务时，改由服务端保存与校验，操作规则保持一致。' : '后端由backend/server.cjs组装接口、业务与存储。前端把明确的页面模型传给views，把令牌传给api；业务层不依赖网页。各层可在一个Node.js进程中运行。'}</p><h4>自己验证一次</h4><p>开始实验 → 提交初始孤岛判断 → 选择未来时刻并预测 → R3 / P1派遣 → 按预计时刻快进至作业完成 → 查看原预测与实际对照 → 结束查看报告。</p><p class="hint">本工作区已接入真实道路两点查询、设置、识别、预测、派遣、推进和报告；独立实景实验等旧模块仍保留。实名账号、正式数据库和远程托管尚未建设。</p><details><summary>查看最近请求（不显示会话令牌）</summary><ol class="lc-traces">${(model.traces || []).map(trace => `<li><b>${esc(trace.method)}</b> <code>${esc(trace.path)}</code> · ${esc(trace.status)} · ${trace.ms}ms${trace.version !== undefined ? ' · 版本' + trace.version : ''}<small>提交字段：${esc(trace.fields.join('、') || '无')}；状态：${esc(trace.phase || '—')}</small></li>`).join('')}</ol></details></details></section>`;
   }
 
   function view(model) {
     const { catalog, online, snapshot, busy, error, notice, explain } = model;
     let content;
-    if (!catalog) content = online === false ? offlineView() : loadingView();
+    if (!catalog) content = online === false ? offlineView(model) : loadingView();
     else if (!snapshot) content = introduction(model);
     else if (snapshot.phase === 'draft') content = preparation(model);
     else if (snapshot.phase === 'running') content = experiment(model);
     else content = reportView(model);
-    return `<div class="learning-shell ${snapshot?.phase === 'running' ? 'is-experiment' : ''} ${model.panelOpen && model.tool === 'identify' && !snapshot?.state?.identification ? 'lc-identifying' : ''}" data-version="${snapshot?.version || 0}" aria-busy="${Boolean(busy)}">${header(model)}${snapshot?.phase==="running"&&!snapshot.state.routingModel?`<div class="lc-legacy-model"><span>本轮为旧拓扑教学模型，保留原进度与成绩。新建课堂可使用真实道路计算。</span><button data-learning="new-road-classroom">新建真实道路课堂</button></div>`:""}${error ? `<div class="lc-error" role="alert">${esc(error)}</div>` : ''}${notice ? `<div class="lc-notice" role="status">${icon('check')}${esc(notice)}</div>` : ''}${explain ? explanation(model) : ''}${content}</div>`;
+    return `<div class="learning-shell ${snapshot?.phase === 'running' ? 'is-experiment' : ''} ${model.panelOpen && model.tool === 'identify' && !snapshot?.state?.identification ? 'lc-identifying' : ''}" data-transport="${model.transport || 'detecting'}" data-version="${snapshot?.version || 0}" aria-busy="${Boolean(busy)}">${header(model)}${snapshot?.phase==="running"&&!snapshot.state.routingModel?`<div class="lc-legacy-model"><span>本轮为旧拓扑教学模型，保留原进度与成绩。新建课堂可使用真实道路计算。</span><button data-learning="new-road-classroom">新建真实道路课堂</button></div>`:""}${error ? `<div class="lc-error" role="alert">${esc(error)}</div>` : ''}${notice ? `<div class="lc-notice" role="status">${icon('check')}${esc(notice)}</div>` : ''}${explain ? explanation(model) : ''}${content}</div>`;
   }
 
   return Object.freeze({ view, renderReport: reportView });
@@ -378,8 +860,8 @@ window.FloodClassroomViews = (() => {
 window.FloodLearningUI = (() => {
   'use strict';
 
-  const storageKey = 'flood-classroom-session-v1';
-  const historyKey = 'flood-classroom-history-v1';
+  let storageKey = 'flood-classroom-session-v1';
+  let historyKey = 'flood-classroom-history-v1';
   const api = window.FloodClassroomAPI.createClient();
   const views = window.FloodClassroomViews;
   const model = {
@@ -387,6 +869,7 @@ window.FloodLearningUI = (() => {
     catalog: null,
     report: null,
     online: null,
+    transport: null,
     busy: false,
     error: '',
     notice: '',
@@ -429,7 +912,13 @@ window.FloodLearningUI = (() => {
   let noticeTimer = null;
   let lastNotice = '';
 
-  // 凭据只保存在本机，不传给显示层，也不写入请求记录。
+  let identityLoaded = false;
+  // 先确定运行方式，再读取对应身份；不把服务器令牌交给单机实验。
+  function loadIdentity(mode) {
+    if (identityLoaded) return;
+    identityLoaded = true;
+    storageKey = mode === 'local' ? 'flood-classroom-local-session-v1' : 'flood-classroom-session-v1';
+    historyKey = mode === 'local' ? 'flood-classroom-local-history-v1' : 'flood-classroom-history-v1';
   try {
     credential = JSON.parse(localStorage.getItem(storageKey) || 'null');
   } catch {
@@ -440,6 +929,7 @@ window.FloodLearningUI = (() => {
     savedSessions = Array.isArray(saved) ? saved.filter(item => /^\d{6}$/.test(item?.code) && /^[A-Za-z0-9_-]{43}$/.test(item?.token)).slice(0, 8) : [];
   } catch { savedSessions = []; }
   updateRecentSessions();
+  }
 
   // 视图只接收名称、阶段和实验码；恢复凭据仍留在控制层。
   function updateRecentSessions() {
@@ -687,14 +1177,14 @@ window.FloodLearningUI = (() => {
       adopt(snapshot);
       if (type === 'predict') freshPrediction();
       const messages = {
-        configure: '本轮条件已保存，可以邀请成员加入。',
+        configure: model.transport === 'local' ? '本轮条件已保存，可以开始实验。' : '本轮条件已保存，可以邀请成员加入。',
         start: '实验已开始。先观察路网，再选择左侧工具。',
         identify: '本组识别判断已保存，下面可核对遗漏与误选。',
         predict: '预测已保存。推进到目标时刻后，将与实际记录对照。',
-        dispatch: '队伍已派出。由教学组织者推进时间，观察道路与可达性变化。',
+        dispatch: model.transport === 'local' ? '队伍已派出。推进或快进时间，观察道路与可达性变化。' : '队伍已派出。由教学组织者推进时间，观察道路与可达性变化。',
         advance: '时间已推进，地图和学习记录已更新。',
         advance_next: '已推进至下一作业时刻或实验时限，请查看最新结果。',
-        review: '教师评阅已保存，组内成员的报告将同步更新。'
+        review: model.transport === 'local' ? '反思自评已保存在本浏览器，自动评价保持不变。' : '教师评阅已保存，组内成员的报告将同步更新。'
       };
       model.notice = messages[type] || '';
       model.report = null;
@@ -744,6 +1234,9 @@ window.FloodLearningUI = (() => {
     if (loading) return;
     loading = true;
     try {
+      const connection = await api.initialize();
+      model.transport = connection.mode;
+      loadIdentity(connection.mode);
       model.catalog = await request('/catalog');
       if (credential) {
         try {
@@ -761,6 +1254,7 @@ window.FloodLearningUI = (() => {
         }
       }
     } catch (error) {
+      model.transport = api.mode;
       model.online = false;
       model.error = error.message;
     } finally {
@@ -962,7 +1456,7 @@ window.FloodLearningUI = (() => {
         @media print{body{max-width:none;padding:0;margin:0}.lc-card,.lc-report-metrics>div{break-inside:avoid}summary{display:none}}
       </style></head><body>
       ${views.renderReport({ ...model, exporting: true }).replace(/<details\b(?![^>]*\bopen\b)([^>]*)>/g, '<details$1 open>')}
-      <p>教学模型：${escapeHTML(snapshot.model.name)}。数据来自后端保存的实验${snapshot.code}。</p></body></html>`;
+      <p>教学模型：${escapeHTML(snapshot.model.name)}。数据来自${model.transport === 'local' ? '本浏览器保存' : '课堂服务保存'}的实验${snapshot.code}。${model.transport === 'local' ? '本报告为单机练习记录，反思部分由实验操作者自评。' : ''}</p></body></html>`;
     const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
     const link = document.createElement('a');
     link.href = url;
@@ -1225,7 +1719,7 @@ function navigationGroup(id){return navigationGroups.find(g=>g.tabs.some(t=>t[0]
 function navIcon(id){const paths={home:'M3 10l9-7 9 7M5 9v11h5v-6h4v6h5V9','real-lab':'M3 5l6-2 6 2 6-2v16l-6 2-6-2-6 2V5M9 3v16M15 5v16',identify:'M10 17a7 7 0 1 0 0-14 7 7 0 0 0 0 14M15 15l6 6M7 10h6M10 7v6',plan:'M8 4h12v16H4V8M4 4h4v4H4zM8 12h8M8 16h5',resources:'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M17 4a4 4 0 0 1 0 7M22 21v-2a4 4 0 0 0-3-3.87',simulate:'M8 5l11 7-11 7V5',results:'M4 3v18h17M8 16v-4M13 16V8M18 16V5',compare:'M8 3v18M16 3v18M3 7h10M11 17h10', 'branch-lab':'M6 3v12a4 4 0 0 0 4 4h8M6 9h8a4 4 0 0 0 4-4V3M15 16l3 3-3 3','challenge-lab':'M12 3v18M3 12h18M5 5l14 14M19 5L5 19','command-duel':'M4 3l17 17M14 20h7v-7M20 3L3 20M3 13v7h7', 'command-scripts':'M8 3h8l4 4v14H4V3h4M15 3v5h5M8 12h8M8 16h5',command:'M4 4h16v12H9l-5 4V4M8 8h8M8 12h5','command-dispatch':'M3 16V7h12v9H3M15 10h3l3 4v2h-6M6 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4M18 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4','command-orders':'M4 10l16-6v16L4 14v-4M7 15v5h4l-1-5','command-reports':'M8 8a4 4 0 0 1 8 0c0 3-4 3-4 6M12 18h.01M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20','command-discussion':'M21 11a8 8 0 0 1-8 8H7l-4 3v-7a8 8 0 0 1 8-12h2a8 8 0 0 1 8 8M8 10h8M8 14h5',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2'};return '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="'+(paths[id]||'M4 4h16v16H4V4M8 8h8M8 12h8M8 16h5')+'"/></svg>';}
 function sidebar(){
  const active=navigationGroup(page).id;
- return `<button class="nav-mobile-toggle" data-action="menu-toggle" aria-controls="course-navigation" aria-expanded="${mobileNavOpen}"><span>课程目录</span><b>${esc(pages.find(p=>p[0]===page)?.[1]||'学习导览')}</b>${navIcon('plan')}</button><div id="course-navigation" class="nav-links"><div class="nav-course"><span>实验课程</span><b>学习与实践</b><button data-action="nav-focus" aria-label="收起课程目录" title="收起课程目录">${navIcon('compare')}</button></div>${navigationGroups.map(g=>`<details class="nav-group" ${g.id===active?'open':''}><summary title="${g.title}">${navIcon({teaching:'real-lab',inquiry:'branch-lab',exercise:'resources',advanced:'settings'}[g.id])}<span class="nav-label">${g.title}</span><i>⌄</i></summary><div class="nav-group-links">${g.tabs.map(([id,title])=>`<button data-nav="${id}" title="${title}" aria-label="${title}" class="${page===id?'active':''}" ${page===id?'aria-current="page"':''}><span class="num">${navIcon(id)}</span><span class="nav-label">${title}</span></button>`).join('')}</div></details>`).join('')}<div class="nav-bottom">进度自动保存在当前浏览器<br><span>学生实践平台 v5.5</span></div></div>`;
+ return `<button class="nav-mobile-toggle" data-action="menu-toggle" aria-controls="course-navigation" aria-expanded="${mobileNavOpen}"><span>课程目录</span><b>${esc(pages.find(p=>p[0]===page)?.[1]||'学习导览')}</b>${navIcon('plan')}</button><div id="course-navigation" class="nav-links"><div class="nav-course"><span>实验课程</span><b>学习与实践</b><button data-action="nav-focus" aria-label="收起课程目录" title="收起课程目录">${navIcon('compare')}</button></div>${navigationGroups.map(g=>`<details class="nav-group" ${g.id===active?'open':''}><summary title="${g.title}">${navIcon({teaching:'real-lab',inquiry:'branch-lab',exercise:'resources',advanced:'settings'}[g.id])}<span class="nav-label">${g.title}</span><i>⌄</i></summary><div class="nav-group-links">${g.tabs.map(([id,title])=>`<button data-nav="${id}" title="${title}" aria-label="${title}" class="${page===id?'active':''}" ${page===id?'aria-current="page"':''}><span class="num">${navIcon(id)}</span><span class="nav-label">${title}</span></button>`).join('')}</div></details>`).join('')}<div class="nav-bottom">进度自动保存在当前浏览器<br><span>学生实践平台 v5.6</span></div></div>`;
 }
 const statusNames={open:'正常通行',limited:'限制通行',blocked:'道路阻断',repair:'正在抢修'},colors={open:'#43c9af',limited:'#ffd078',blocked:'#fc727e',repair:'#6faaff'};
 const names=id=>E.nodes.find(n=>n.id===id)?.name||id;
@@ -1268,9 +1762,9 @@ function learningHome(){
  const scenario=E.scenarios.find(v=>v.id===state.scenario),next=StudentSupport.next();
  const steps=[['identify','孤岛识别','找出断连聚落',!!state.identification],['plan','预算规划','比较通道收益',!!state.plan.length||state.spent>0],['resources','队伍派遣','确认进场条件',state.spent>0],['simulate','动态推演','观察路网变化',state.time>0],['results','评价复盘','用证据解释决策',!!state.reflection.trim()]];
  const done=steps.filter(x=>x[3]).length;
- const lessons=[['classroom','01','课堂协作实验','共同观察，一起作出判断','组织者设置条件，同学识别、预测与派遣，在同一份报告中回看决策。','协作课堂','blue'],['real-lab','02','真实路网实验','把决策放回真实城市','进入徐州实际道路网络，观察积水、设施与通道的空间关系。','空间探索','teal'],['branch-lab','03','分支复盘','换一种选择，验证不同结果','保留关键决策时刻，以同样的初始条件比较两种抢通方案。','对照研究','orange'],['command-duel','04','同伴脚本对战','从解决问题，到设计问题','双方设置情景、交换任务，用彼此的方案检验脚本与处置思路。','同伴探究','purple']];
+ const lessons=[['classroom','01','课堂实验','观察城市，验证自己的决策','在线单机即可完成识别、预测、派遣与复盘；接入课堂服务后可与同伴协作。','课堂学习','blue'],['real-lab','02','真实路网实验','把决策放回真实城市','进入徐州实际道路网络，观察积水、设施与通道的空间关系。','空间探索','teal'],['branch-lab','03','分支复盘','换一种选择，验证不同结果','保留关键决策时刻，以同样的初始条件比较两种抢通方案。','对照研究','orange'],['command-duel','04','同伴脚本对战','从解决问题，到设计问题','双方设置情景、交换任务，用彼此的方案检验脚本与处置思路。','同伴探究','purple']];
  return `<nav class="course-top-nav" aria-label="课程快捷导航"><span aria-current="page">课程首页</span><button data-nav="classroom">课堂实验</button><button data-nav="records">学习记录</button><a href="tutorial.html">学习指南 ↗</a></nav>
- <section class="course-hero"><img class="course-hero-photo" src="xuzhou-3d-preview.jpg?v=52" alt="徐州云龙湖实拍，湖岸建筑、音乐厅与城市天际线"><div class="course-hero-copy"><div class="course-eyebrow"><i></i>交通与防灾 · 虚拟仿真实验课程</div><h1>在真实城市中，<br>推演每一次决策。</h1><p>从一条受阻道路出发，理解城市连通、资源约束与抢通顺序。先作判断，再用实验检验。</p><div class="course-hero-actions"><button class="primary" data-nav="classroom">进入课堂实验 <span>→</span></button><button data-nav="real-lab">探索实景路网 ↗</button></div><div class="course-hero-topics"><span>孤岛识别</span><span>动态规划</span><span>同伴探究</span></div></div><span class="course-location">江苏 · 徐州云龙湖 <small>真实城市 / 教学情景</small></span></section>
+ <section class="course-hero"><img class="course-hero-photo" src="xuzhou-3d-preview.jpg?v=56" alt="徐州云龙湖实拍，湖岸建筑、音乐厅与城市天际线"><div class="course-hero-copy"><div class="course-eyebrow"><i></i>交通与防灾 · 虚拟仿真实验课程</div><h1>在真实城市中，<br>推演每一次决策。</h1><p>从一条受阻道路出发，理解城市连通、资源约束与抢通顺序。先作判断，再用实验检验。</p><div class="course-hero-actions"><button class="primary" data-nav="classroom">进入课堂实验 <span>→</span></button><button data-nav="real-lab">探索实景路网 ↗</button></div><div class="course-hero-topics"><span>孤岛识别</span><span>动态规划</span><span>同伴探究</span></div></div><span class="course-location">江苏 · 徐州云龙湖 <small>真实城市 / 教学情景</small></span></section>
  <div class="course-photo-credit">实拍摄影：<a href="https://commons.wikimedia.org/wiki/File:20260722_Yunlong_Lake_Xuzhou_05.jpg" target="_blank" rel="noopener">祝鱼贵 / Wikimedia Commons</a> · <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener">CC BY-SA 4.0</a> · 原图未修改，页面裁切展示</div>
  <section class="course-orientation" aria-label="学习方式"><div><span class="orientation-number">01</span><div><b>读懂空间</b><small>地图、路况与设施关系</small></div></div><div><span class="orientation-number">02</span><div><b>验证决策</b><small>预算、工期与可达性变化</small></div></div><div><span class="orientation-number">03</span><div><b>解释结果</b><small>预测对照与过程证据</small></div></div><a href="tutorial.html">第一次使用？<b>查看学习指南 →</b></a></section>
  <details class="course-catalog course-disclosure"><summary><span>选择其他学习方式<small>实景探索、分支复盘与同伴挑战</small></span><b>展开 ＋</b></summary><div class="course-card-grid">${lessons.filter(item=>item[0]!=='classroom').map(([id,num,title,subtitle,description,label,color])=>`<article class="course-card is-${color}"><div class="course-card-top"><span class="course-card-label">${label}</span><span class="course-card-number">${num}</span></div><h3>${title}</h3><b>${subtitle}</b><p>${description}</p><button data-nav="${id}">进入实验 <span>↗</span></button></article>`).join('')}</div></details>
