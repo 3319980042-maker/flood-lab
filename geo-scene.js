@@ -13,6 +13,241 @@
 })(typeof globalThis!=='undefined'?globalThis:this);
 
 ;
+/* Visual geometry only. Road closures and water depths remain authoritative inputs. */
+(function (root, factory) {
+  'use strict';
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.FloodHazardScene = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+  const EPS = 1e-7;
+  const MAX_SEGMENTS = 512;
+  const featureCollection = () => ({ type: 'FeatureCollection', features: [] });
+  const finitePoint = point => Array.isArray(point) && point.length >= 2 && Number.isFinite(point[0]) && Number.isFinite(point[1]) && Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= 85;
+  const key = value => String(value);
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const number = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1];
+  const cross = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  function seed(value) {
+    let result = 2166136261;
+    for (const char of String(value)) result = Math.imul(result ^ char.charCodeAt(0), 16777619);
+    return result >>> 0;
+  }
+  function noise(value, index) {
+    let result = (value ^ Math.imul(index + 1, 374761393)) >>> 0;
+    result = Math.imul(result ^ result >>> 13, 1274126177);
+    return ((result ^ result >>> 16) >>> 0) / 4294967295;
+  }
+  function projection(origin) {
+    const scaleX = Math.cos(origin[1] * Math.PI / 180) * 111320;
+    return {
+      to: point => [(point[0] - origin[0]) * scaleX, (point[1] - origin[1]) * 110574],
+      from: point => [origin[0] + point[0] / scaleX, origin[1] + point[1] / 110574]
+    };
+  }
+  function circle(center, radius) {
+    return Array.from({ length: 48 }, (_, index) => {
+      const angle = index * Math.PI / 24;
+      return [center[0] + Math.cos(angle) * radius, center[1] + Math.sin(angle) * radius];
+    });
+  }
+  function clip(polygon, boundary) {
+    let output = polygon;
+    for (let index = 0; index < boundary.length && output.length; index++) {
+      const a = boundary[index], b = boundary[(index + 1) % boundary.length], input = output;
+      output = [];
+      for (let position = 0; position < input.length; position++) {
+        const p = input[position], q = input[(position + 1) % input.length];
+        const pSide = cross(a, b, p), qSide = cross(a, b, q);
+        const pIn = pSide >= -EPS, qIn = qSide >= -EPS;
+        if (pIn) output.push(p);
+        if (pIn !== qIn) {
+          const ratio = pSide / (pSide - qSide);
+          output.push([p[0] + (q[0] - p[0]) * ratio, p[1] + (q[1] - p[1]) * ratio]);
+        }
+      }
+    }
+    return output.filter((point, index) => !index || Math.hypot(point[0] - output[index - 1][0], point[1] - output[index - 1][1]) > EPS);
+  }
+  function area(polygon) {
+    return Math.abs(polygon.reduce((sum, point, index) => {
+      const next = polygon[(index + 1) % polygon.length];
+      return sum + point[0] * next[1] - next[0] * point[1];
+    }, 0)) / 2;
+  }
+  function ring(polygon, project) {
+    if (polygon.length < 3 || area(polygon) < .015) return null;
+    const result = polygon.map(project.from);
+    result.push(result[0].slice());
+    return result;
+  }
+  function polygonFeature(polygon, project, properties) {
+    const coordinates = ring(polygon, project);
+    return coordinates ? { type: 'Feature', properties, geometry: { type: 'Polygon', coordinates: [coordinates] } } : null;
+  }
+  function pointOn(axis, normal, along, across = 0) {
+    return [axis[0] * along + normal[0] * across, axis[1] * along + normal[1] * across];
+  }
+  function rectangle(axis, normal, along, across, halfLength, halfWidth) {
+    return [[-halfLength, -halfWidth], [halfLength, -halfWidth], [halfLength, halfWidth], [-halfLength, halfWidth]].map(offset => pointOn(axis, normal, along + offset[0], across + offset[1]));
+  }
+  function inside(point, polygon) {
+    let found = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const a = polygon[i], b = polygon[j];
+      if ((a[1] > point[1]) !== (b[1] > point[1]) && point[0] < (b[0] - a[0]) * (point[1] - a[1]) / (b[1] - a[1]) + a[0]) found = !found;
+    }
+    return found;
+  }
+  function parts(circles, length, axis, normal) {
+    const boundaries = [0, length];
+    for (const item of circles) {
+      item.along = dot(item.center, axis); item.across = dot(item.center, normal);
+      const delta = item.radius * item.radius - item.across * item.across;
+      if (delta <= 0) continue;
+      const reach = Math.sqrt(delta);
+      item.start = clamp(item.along - reach, 0, length); item.end = clamp(item.along + reach, 0, length);
+      if (item.end - item.start > .025) boundaries.push(item.start, item.end);
+    }
+    // The power bisector partitions overlapping circles into disjoint road slices.
+    // This avoids repeated surfaces when multiple tasks affect the same segment.
+    for (let a = 0; a < circles.length; a++) for (let b = a + 1; b < circles.length; b++) {
+      const first = circles[a], second = circles[b], divisor = 2 * (first.along - second.along);
+      if (Math.abs(divisor) < EPS) continue;
+      const crossing = (dot(first.center, first.center) - first.radius * first.radius - dot(second.center, second.center) + second.radius * second.radius) / divisor;
+      if (crossing > 0 && crossing < length) boundaries.push(crossing);
+    }
+    boundaries.sort((a, b) => a - b);
+    const sorted = boundaries.filter((value, index) => !index || value - boundaries[index - 1] > .025), result = [];
+    for (let index = 1; index < sorted.length; index++) {
+      const start = sorted[index - 1], end = sorted[index], midpoint = (start + end) / 2;
+      const eligible = circles.filter(item => item.start <= midpoint && item.end >= midpoint).sort((a, b) => {
+        const score = item => item.radius * item.radius - Math.pow(midpoint - item.along, 2) - item.across * item.across;
+        return score(b) - score(a) || key(a.task.id).localeCompare(key(b.task.id));
+      });
+      if (!eligible.length) continue;
+      const previous = result[result.length - 1], owner = eligible[0];
+      if (previous?.owner === owner && Math.abs(previous.end - start) < .05) previous.end = end;
+      else result.push({ start, end, owner });
+    }
+    return result;
+  }
+  function build({ tasks = [], roadStates = [], segments = [], edges = [] } = {}) {
+    const result = Object.fromEntries(['water', 'ripples', 'breaks', 'debris', 'barriers', 'closurePoints', 'restored'].map(name => [name, featureCollection()]));
+    const edgeMap = new Map((Array.isArray(edges) ? edges : []).map(edge => [key(edge.id), edge]));
+    const taskMap = new Map();
+    for (const task of Array.isArray(tasks) ? tasks : []) {
+      if (!task || !finitePoint(task.point)) continue;
+      const edge = edgeMap.get(key(task.id));
+      const value = name => edge && Object.prototype.hasOwnProperty.call(edge, name) ? edge[name] : task[name];
+      taskMap.set(key(task.id), { ...task, depth: Math.max(0, number(value('depth'))), damage: !!value('damage'), repaired: !!value('repaired'), working: !!task.working, radius: clamp(number(task.radius, 60), 1, 200), segmentIds: new Set((task.segmentIds || []).map(key)) });
+    }
+    const segmentMap = new Map((Array.isArray(segments) ? segments : []).filter(segment => segment && finitePoint(segment.a) && finitePoint(segment.b)).map(segment => [key(segment.id), segment]));
+    const roads = new Map();
+    for (const road of Array.isArray(roadStates) ? roadStates : []) {
+      if (!road || !['blocked', 'limited'].includes(road.status) || !segmentMap.has(key(road.id))) continue;
+      const id = key(road.id), prior = roads.get(id);
+      const taskIds = [...new Set([...(prior?.taskIds || []), ...(road.taskIds || []).map(key)])];
+      roads.set(id, { id, status: prior?.status === 'blocked' || road.status === 'blocked' ? 'blocked' : 'limited', taskIds });
+    }
+    const active = [...roads.values()].sort((a, b) => a.id.localeCompare(b.id));
+    for (const road of active.slice(0, MAX_SEGMENTS)) {
+      const segment = segmentMap.get(road.id), project = projection(segment.a), endPoint = project.to(segment.b), length = Math.hypot(...endPoint);
+      if (length < .1) continue;
+      const axis = endPoint.map(value => value / length), normal = [-axis[1], axis[0]], random = seed(road.id);
+      const assigned = road.taskIds.length ? road.taskIds.map(id => taskMap.get(id)).filter(Boolean) : [...taskMap.values()].filter(task => task.segmentIds.has(road.id));
+      const owners = assigned.filter(task => !task.repaired && task.segmentIds.has(road.id));
+      if (!owners.length) continue;
+      const circles = owners.map(task => ({ task, center: project.to(task.point), radius: task.radius }));
+      const slices = parts(circles, length, axis, normal);
+      if (!slices.length) continue;
+      const depth = Math.max(...owners.map(task => task.depth)), damage = owners.some(task => task.damage), working = owners.some(task => task.working);
+      const flooded = owners.filter(task => task.depth >= .15), damaged = owners.filter(task => task.damage);
+      const kind = flooded.length && damage ? 'mixed' : damage ? 'damage' : flooded.length ? 'flood' : 'work';
+      const color = depth >= .6 ? '#145f82' : depth >= .3 ? '#2088a4' : '#56b8c9';
+      const taskIds = owners.map(task => task.id).sort((a, b) => key(a).localeCompare(key(b)));
+      const common = { segmentId: segment.id, road: segment.id, taskIds, taskId: taskIds[0], status: road.status, depth, damage, working, kind, color };
+      const pushPolygon = (name, polygon, properties) => {
+        const feature = polygonFeature(polygon, project, { ...common, ...properties });
+        if (feature) result[name].features.push(feature);
+      };
+      const floodCircles = circles.filter(item => item.task.depth >= .15);
+      const waterPolygons = [];
+      const waterSlices = parts(floodCircles, length, axis, normal);
+      for (let index = 0; index < waterSlices.length; index++) {
+        const slice = waterSlices[index], steps = clamp(Math.ceil((slice.end - slice.start) / 6), 2, 24), left = [], right = [];
+        // Teaching footprint follows the street, with roadside ponding inside the task zone.
+        // This is a visual envelope, not a surveyed inundation boundary.
+        const halfWidth = clamp(15 + depth * 31, 19, 43);
+        for (let step = 0; step <= steps; step++) {
+          const along = slice.start + (slice.end - slice.start) * step / steps;
+          // Gradual variations form a local pool rather than a perfect road rectangle.
+          const basin = .7 + .5 * Math.exp(-Math.pow((along - slice.owner.along) / 28, 2));
+          const lateral = slice.owner.across * .58;
+          left.push(pointOn(axis, normal, along, lateral + halfWidth * basin * (.86 + noise(random, step + index * 80) * .25)));
+          right.push(pointOn(axis, normal, along, lateral - halfWidth * basin * (.84 + noise(random, step + index * 80 + 32) * .28)));
+        }
+        const polygon = clip([...left, ...right.reverse()], circle(slice.owner.center, slice.owner.radius));
+        if (polygon.length >= 3 && area(polygon) >= .1) waterPolygons.push(polygon);
+      }
+      if (waterPolygons.length) {
+        const coordinates = waterPolygons.map(polygon => [ring(polygon, project)]).filter(item => item[0]);
+        result.water.features.push({ type: 'Feature', properties: { ...common, id: `water-${road.id}`, height: depth, base: 0, tone: depth >= .6 ? 'deep' : depth >= .3 ? 'medium' : 'shallow' }, geometry: coordinates.length === 1 ? { type: 'Polygon', coordinates: coordinates[0] } : { type: 'MultiPolygon', coordinates } });
+        for (let index = 0; index < Math.min(waterSlices.length, 3); index++) {
+          const slice = waterSlices[index];
+          for (let row = 0; row < 2; row++) {
+            const middle = slice.start + (slice.end - slice.start) * (.34 + row * .32), across = (row ? 1 : -1) * Math.min(3, 1 + depth);
+            const span = Math.min(4, (slice.end - slice.start) / 9);
+            const points = [-1, -.3, .35, 1].map((value, position) => pointOn(axis, normal, middle + value * span, across + Math.sin(position * 1.3 + row) * .45));
+            if (span > .3 && points.every(point => waterPolygons.some(polygon => inside(point, polygon)))) result.ripples.features.push({ type: 'Feature', properties: { ...common, id: `ripple-${road.id}-${index}-${row}`, height: depth + .012, base: depth, color: '#b9e9ec' }, geometry: { type: 'LineString', coordinates: points.map(project.from) } });
+          }
+        }
+      }
+      const central = slices.reduce((best, item) => item.end - item.start > best.end - best.start ? item : best, slices[0]);
+      const midpoint = (central.start + central.end) / 2;
+      result.closurePoints.features.push({ type: 'Feature', properties: { ...common, id: `closure-${road.id}` }, geometry: { type: 'Point', coordinates: project.from(pointOn(axis, normal, central.start + Math.min(10, (central.end - central.start) * .2))) } });
+      if (road.status !== 'blocked') continue;
+      const damageSlices = parts(circles.filter(item => item.task.damage), length, axis, normal);
+      for (let index = 0; index < Math.min(damageSlices.length, 2); index++) {
+        const slice = damageSlices[index], center = (slice.start + slice.end) / 2, halfLength = Math.min(11, (slice.end - slice.start) * .33), width = 5.6;
+        const polygon = [[-1, -.8], [-.58, -1], [-.18, -.8], [.35, -1], [1, -.65], [.85, .2], [1, .85], [.24, 1], [-.2, .76], [-.85, 1], [-1, .3]].map(point => pointOn(axis, normal, center + point[0] * halfLength, point[1] * width));
+        pushPolygon('breaks', clip(polygon, circle(slice.owner.center, slice.owner.radius)), { id: `break-${road.id}-${index}`, color: '#292b2e', height: .018, base: 0 });
+        for (let stone = 0; stone < 5; stone++) {
+          const along = center + (noise(random, stone + 140) - .5) * halfLength * 1.8, across = (noise(random, stone + 160) - .5) * 5.8;
+          const radius = .35 + noise(random, stone + 180) * .55;
+          const pieces = Array.from({ length: 5 }, (_, corner) => {
+            const angle = corner * Math.PI * 2 / 5 + noise(random, stone + 200) * 2;
+            return pointOn(axis, normal, along + Math.cos(angle) * radius * 1.35, across + Math.sin(angle) * radius);
+          });
+          pushPolygon('debris', clip(pieces, circle(slice.owner.center, slice.owner.radius)), { id: `debris-${road.id}-${index}-${stone}`, color: stone % 2 ? '#87847d' : '#b2aaa0', height: .15 + noise(random, stone + 220) * .45, base: 0 });
+        }
+      }
+      // A barrier is an anchored crossbeam and two legs, never a screen-space icon.
+      // Keep it inside the same task influence circle and on the blocked road.
+      const barrierCircle = central.owner, barrierAt = central.start + Math.min(10, (central.end - central.start) * .2);
+      const boundary = circle(barrierCircle.center, barrierCircle.radius);
+      for (let stripe = 0; stripe < 6; stripe++) pushPolygon('barriers', clip(rectangle(axis, normal, barrierAt, -3 + stripe * 1.2, .18, .6), boundary), { id: `barrier-${road.id}-${stripe}`, color: stripe % 2 ? '#26303b' : '#f4bd45', base: .52, height: .95 });
+      for (let leg = 0; leg < 2; leg++) pushPolygon('barriers', clip(rectangle(axis, normal, barrierAt, leg ? 3 : -3, .23, .23), boundary), { id: `barrier-leg-${road.id}-${leg}`, color: '#e4a72c', base: 0, height: 1.04 });
+    }
+    const repairedBySegment = new Map();
+    for (const task of taskMap.values()) if (task.repaired) for (const id of task.segmentIds) {
+      if (!segmentMap.has(id) || roads.has(id)) continue;
+      if (!repairedBySegment.has(id)) repairedBySegment.set(id, []);
+      repairedBySegment.get(id).push(task.id);
+    }
+    for (const [id, taskIds] of [...repairedBySegment].slice(0, MAX_SEGMENTS)) {
+      const segment = segmentMap.get(id);
+      result.restored.features.push({ type: 'Feature', properties: { id: `restored-${id}`, segmentId: segment.id, road: segment.id, taskIds, taskId: taskIds[0], status: 'open', kind: 'restored', depth: 0, damage: false, color: '#28a278' }, geometry: { type: 'LineString', coordinates: [segment.a.slice(), segment.b.slice()] } });
+    }
+    result.meta = { activeSegments: active.length, renderedSegments: result.closurePoints.features.length, truncatedSegments: Math.max(0, active.length - MAX_SEGMENTS) };
+    return result;
+  }
+  return { build };
+});
+
+;
 /* Shared geographical renderer for real-street and historical topology experiments. */
 window.FloodGeoScene = (() => {
   'use strict';
@@ -35,6 +270,12 @@ window.FloodGeoScene = (() => {
   let drawingColor='#f5ae52',baseMode='geographic',rainFrame=null,rainLast=0,rainDrops=[],weatherCanvas;
   let localWeather={type:'rain',rain:45,night:false},toolsOpen=false;
   let correctingCamera=false;
+  let hazardTimer=null,hazardSignature='',hazardInView=true,hazardObserver;
+  const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
+  const classroomLayers={roads:true,floods:true};
+  const hazardSources=['classroom-water','classroom-ripples','classroom-breaks','classroom-debris','classroom-barriers','classroom-closure-points','classroom-restored'];
+  const hazardFloodLayers=['classroom-water-bed','classroom-water-depth','classroom-water-edge','classroom-water-glint','classroom-water-ripples'];
+  const hazardRoadLayers=['classroom-closed-road-casing','classroom-closed-road','classroom-damage-bed','classroom-damage-cracks','classroom-debris-3d','classroom-barriers-3d','classroom-closure-disc','classroom-closure-sign','classroom-limited-sign','classroom-restored-halo','classroom-restored-road'];
   const visible={network:true,buildings:true,detail:true,geography:true,weather:true,annotations:true,command:true};
   const networkModes={practice:true,command:false};
   const empty=()=>({type:'FeatureCollection',features:[]});
@@ -73,6 +314,8 @@ window.FloodGeoScene = (() => {
     if(!host)return;
     if(!parking){parking=document.createElement('div');parking.hidden=true;document.body.append(parking);}
     parking.append(host);
+    stopHazardAnimation();stopRain();
+    if(loaded){map.getSource('classroom-selected-building')?.setData(empty());hazardSignature='';for(const source of hazardSources)map.getSource(source)?.setData(empty());for(const layer of [...hazardFloodLayers,...hazardRoadLayers])if(map.getLayer(layer))map.setLayoutProperty(layer,'visibility','none');}
   }
   function mount(context){
     if(ctx)networkModes[ctx.command?'command':'practice']=visible.network;
@@ -82,6 +325,7 @@ window.FloodGeoScene = (() => {
     if(!slot){stopTour();return;}
     if(!host){host=document.createElement('div');host.className='geo-canvas';}
     slot.append(host);
+    if(!hazardObserver&&window.IntersectionObserver){hazardObserver=new IntersectionObserver(entries=>{hazardInView=!!entries[0]?.isIntersecting;updateHazardAnimation();applyWeather();});hazardObserver.observe(host);}
     if(!window.maplibregl){failure();return;}
     if(!map&&!failed)init();
     if(map){requestAnimationFrame(()=>{map.resize(); if(loaded)sync();});}
@@ -130,12 +374,14 @@ window.FloodGeoScene = (() => {
       map.on('pitch',updateReadout);
       map.on('error',event=>{console.warn('地图渲染提示',event.error?.message||'');});
       map.on('webglcontextlost',failure);
-      map.on('click','teaching-roads',event=>{if(isCapturing())return;const f=event.features?.[0];if(!f)return;if(ctx?.realLab){popup?.remove();popup=new maplibregl.Popup().setLngLat(event.lngLat).setHTML(`<div class="geo-tooltip"><b>真实道路段 ${escape(f.properties.segment)}</b><p>${escape(({open:'正常通行',limited:'积水限行，速度减半',blocked:'灾情阻断，禁止通行'})[f.properties.state]||'道路状态')}</p><small>道路段参与当前绕行和可达性计算</small></div>`).addTo(map);return;}act({road:f.properties.id});});
+      map.on('click','teaching-roads',event=>{if(isCapturing())return;const f=event.features?.[0];if(!f)return;if(ctx?.realLab){popup?.remove();popup=new maplibregl.Popup().setLngLat(event.lngLat).setHTML(`<div class="geo-tooltip"><b>真实道路段 ${escape(f.properties.segment)}</b><p>${escape(({open:'正常通行',limited:'积水限行，速度减半',blocked:'灾情阻断，禁止通行'})[f.properties.state]||'道路状态')}</p><small>道路段参与当前绕行和可达性计算</small></div>`).addTo(map);return;}if(ctx?.classroomSpatial){const task=f.properties.taskIds?.split(',').find(id=>ctx.state.edges.some(edge=>edge.id===id));if(task)act({road:task});return;}act({road:f.properties.id});});
       map.on('mouseenter','teaching-roads',()=>map.getCanvas().style.cursor=isCapturing()?'crosshair':'pointer');
       map.on('mouseleave','teaching-roads',()=>map.getCanvas().style.cursor=isCapturing()?'crosshair':'');
       map.on('click','buildings-3d',event=>{
         if(isCapturing()||event.originalEvent?.defaultPrevented)return;
+        if(ctx?.classroomSpatial&&map.queryRenderedFeatures(event.point,{layers:['classroom-closure-sign','classroom-barriers-3d'].filter(id=>map.getLayer(id))}).length)return;
         const f=event.features?.[0];if(!f)return;
+        if(ctx?.classroomSpatial&&f.properties.buildingId){if(event.originalEvent)event.originalEvent._floodBuildingHandled=true;event.preventDefault();popup?.remove();window.dispatchEvent(new CustomEvent('flood-building-selected',{detail:{buildingId:f.properties.buildingId}}));return;}
         popup?.remove();popup=new maplibregl.Popup({maxWidth:'260px',closeButton:true}).setLngLat(event.lngLat).setHTML(`<div class="geo-tooltip"><b>${escape(f.properties.name||'徐州建筑')}</b><p>开放地图建筑轮廓<br>示意高度 ${Math.round(Number(f.properties.render_height)||9)} m</p><small>用于街区空间认知，非测绘模型</small></div>`).addTo(map);
       });
       map.on('click',captureMapClick);
@@ -212,7 +458,7 @@ window.FloodGeoScene = (() => {
     const polygon=(ring,props)=>({type:'Feature',properties:props,geometry:{type:'Polygon',coordinates:[ring]}});
     const disk=(p,r,props)=>polygon(Array.from({length:9},(_,i)=>move(p,Math.cos(i*Math.PI/4)*r,Math.sin(i*Math.PI/4)*r)),props);
     const inside=(p,ring)=>{let hit=false;for(let i=0,j=ring.length-1;i<ring.length;j=i++){const a=ring[i],b=ring[j];if((a[1]>p[1])!==(b[1]>p[1])&&p[0]<(b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0])hit=!hit;}return hit;};
-    const envelopes=[];
+    const envelopes=[];let buildingOrdinal=0;const buildingEntries=window.FloodClassroomNetwork?.buildingCatalog(data.buildings).entries||[];
     for(const f of data.buildings.features){
       const parts=f.geometry.type==='Polygon'?[f.geometry.coordinates]:f.geometry.type==='MultiPolygon'?f.geometry.coordinates:[];
       for(const coordinates of parts){
@@ -220,7 +466,7 @@ window.FloodGeoScene = (() => {
         const xs=ring.map(p=>p[0]),ys=ring.map(p=>p[1]),box=[Math.min(...xs),Math.min(...ys),Math.max(...xs),Math.max(...ys)];
         envelopes.push({ring,box});
         const variant=Math.floor(random()*4),wall=['#c5b9a6','#c1c1b4','#b8b7ae','#d3c9b7'][variant],roof=['#827d73','#777f7b','#988879','#9b8171'][variant];
-        features.push({type:'Feature',geometry:{type:'Polygon',coordinates},properties:{...f.properties,facade:wall,roof}});
+        features.push({type:'Feature',geometry:{type:'Polygon',coordinates},properties:{...f.properties,buildingId:buildingEntries[buildingOrdinal++]?.id,facade:wall,roof}});
         roofs.push({type:'Feature',geometry:{type:'Polygon',coordinates},properties:{base:h,height:h+.35,color:roof}});
         const shift=[-h*.32*meterX,h*.18*meterY];
         shadows.push(polygon(ring.map(p=>[p[0]+shift[0],p[1]+shift[1]]),{}));
@@ -302,8 +548,66 @@ window.FloodGeoScene = (() => {
     map.addLayer({id:'flood-areas',type:'fill',source:'flood-areas',paint:{'fill-color':'#519fc4','fill-opacity':.22}});
     map.addLayer({id:'flood-depth',type:'fill-extrusion',source:'flood-areas',paint:{'fill-extrusion-color':'#4a9fca','fill-extrusion-height':['coalesce',['get','height'],0],'fill-extrusion-opacity':.48}});
     addSceneDetail(data);
+    addClassroomHazardLayers();
     addGeographyLabels(data.labels);
     addCommandLayers();
+  }
+  function addClassroomHazardLayers(){
+    for(const source of hazardSources)map.addSource(source,{type:'geojson',data:empty()});
+    const surface=document.createElement('canvas');surface.width=surface.height=128;const water=surface.getContext('2d');
+    // A local seamless surface texture supplies reflections without fetching an
+    // image or updating geographical geometry on animation frames.
+    for(let row=-1;row<9;row++){const y=row*16;water.strokeStyle=row%2?'#d9eee8a0':'#9fc9d06b';water.lineWidth=row%3?1:2;water.beginPath();for(let x=-12;x<=140;x+=4){const v=y+Math.sin(x*Math.PI/64+row)*2.2;x===-12?water.moveTo(x,v):water.lineTo(x,v);}water.stroke();}
+    map.addImage('classroom-water-reflection',water.getImageData(0,0,128,128),{pixelRatio:2});
+    const sign=document.createElement('canvas');sign.width=sign.height=96;const c=sign.getContext('2d');
+    c.shadowColor='#142b3490';c.shadowBlur=5;c.shadowOffsetY=3;c.beginPath();c.arc(48,45,35,0,Math.PI*2);c.fillStyle='#faf8ed';c.fill();c.shadowBlur=0;c.shadowOffsetY=0;c.beginPath();c.arc(48,45,29,0,Math.PI*2);c.fillStyle='#b92f2b';c.fill();c.fillStyle='#fff9ec';c.fillRect(27,39,42,11);map.addImage('classroom-no-entry',c.getImageData(0,0,96,96),{pixelRatio:2});
+    const add=(layer,before)=>map.addLayer({...layer,layout:{...layer.layout,visibility:'none'}},before);
+    const before='buildings-3d';
+    const depthColor=['match',['get','tone'],'deep','#285d70','medium','#477f8d','#7bafb0'];
+    add({id:'classroom-water-bed',type:'fill',source:'classroom-water',paint:{'fill-color':depthColor,'fill-opacity':.84}},before);
+    add({id:'classroom-water-depth',type:'fill-extrusion',source:'classroom-water',paint:{'fill-extrusion-color':depthColor,'fill-extrusion-base':0,'fill-extrusion-height':['max',0,['coalesce',['get','height'],0]],'fill-extrusion-opacity':.7,'fill-extrusion-vertical-gradient':false}});
+    add({id:'classroom-water-edge',type:'line',source:'classroom-water',layout:{'line-join':'round'},paint:{'line-color':'#8d805b','line-width':['interpolate',['linear'],['zoom'],13,.5,17,1.4,19,2.1],'line-opacity':.9}},before);
+    add({id:'classroom-water-glint',type:'fill',source:'classroom-water',paint:{'fill-pattern':'classroom-water-reflection','fill-opacity':.34}},before);
+    add({id:'classroom-water-ripples',type:'line',source:'classroom-ripples',minzoom:14.3,layout:{'line-cap':'round'},paint:{'line-color':'#d4ede6','line-width':['interpolate',['linear'],['zoom'],14,.55,18,1.4],'line-opacity':.36}},before);
+    add({id:'classroom-closed-road-casing',type:'line',source:'teaching',filter:['==',['get','state'],'blocked'],layout:{'line-cap':'butt','line-join':'round'},paint:{'line-color':'#f6d9ca','line-width':['interpolate',['linear'],['zoom'],12,5,16,10,19,19],'line-opacity':.92}},before);
+    add({id:'classroom-closed-road',type:'line',source:'teaching',filter:['==',['get','state'],'blocked'],layout:{'line-cap':'butt','line-join':'round'},paint:{'line-color':'#ae3835','line-width':['interpolate',['linear'],['zoom'],12,3,16,6,19,12],'line-dasharray':[2.5,1],'line-opacity':.92}},before);
+    add({id:'classroom-damage-bed',type:'fill',source:'classroom-breaks',paint:{'fill-color':'#252d2c','fill-opacity':1}},before);
+    add({id:'classroom-damage-cracks',type:'line',source:'classroom-breaks',layout:{'line-join':'miter'},paint:{'line-color':'#a19372','line-width':['interpolate',['linear'],['zoom'],14,.6,18,1.7],'line-opacity':.95}},before);
+    for(const [id,source]of [['classroom-debris-3d','classroom-debris'],['classroom-barriers-3d','classroom-barriers']])add({id,type:'fill-extrusion',source,minzoom:15,paint:{'fill-extrusion-color':['coalesce',['get','color'],'#a38765'],'fill-extrusion-base':['coalesce',['get','base'],0],'fill-extrusion-height':['coalesce',['get','height'],.4],'fill-extrusion-opacity':1,'fill-extrusion-vertical-gradient':true}});
+    add({id:'classroom-closure-disc',type:'circle',source:'classroom-closure-points',filter:['==',['get','status'],'blocked'],paint:{'circle-color':'#742622','circle-opacity':.35,'circle-radius':['interpolate',['linear'],['zoom'],12,3,16,4,19,6],'circle-stroke-color':'#ffe4cc','circle-stroke-width':1.2}});
+    add({id:'classroom-closure-sign',type:'symbol',source:'classroom-closure-points',filter:['==',['get','status'],'blocked'],layout:{'icon-image':'classroom-no-entry','icon-size':['interpolate',['linear'],['zoom'],12,.54,16,.75,19,.94],'icon-allow-overlap':false,'icon-ignore-placement':false,'icon-anchor':'bottom','icon-offset':[0,-8],'icon-pitch-alignment':'viewport'}});
+    add({id:'classroom-limited-sign',type:'circle',source:'classroom-closure-points',filter:['==',['get','status'],'limited'],paint:{'circle-color':'#e0a333','circle-radius':['interpolate',['linear'],['zoom'],12,4,17,7],'circle-stroke-color':'#fff5d4','circle-stroke-width':2}});
+    add({id:'classroom-restored-halo',type:'line',source:'classroom-restored',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#edf9d9','line-width':['interpolate',['linear'],['zoom'],12,4,16,9,19,16],'line-opacity':.8}},before);
+    add({id:'classroom-restored-road',type:'line',source:'classroom-restored',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#268756','line-width':['interpolate',['linear'],['zoom'],12,2.5,16,5,19,10],'line-opacity':.95}},before);
+    for(const id of ['classroom-water-bed','classroom-damage-bed','classroom-debris-3d','classroom-barriers-3d','classroom-closure-sign','classroom-closed-road']){
+      map.on('click',id,event=>{if(isCapturing()||!ctx?.classroomSpatial||(event.originalEvent?._floodHazardHandled||event.originalEvent?._floodBuildingHandled))return;const feature=event.features?.[0];if(!feature)return;let ids=feature.properties.taskIds;try{if(typeof ids==='string')ids=JSON.parse(ids);}catch{ids=String(ids).split(',');}const taskId=feature.properties.taskId||(Array.isArray(ids)?ids:[]).find(id=>ctx.state.edges.some(edge=>edge.id===id));if(taskId){if(event.originalEvent)event.originalEvent._floodHazardHandled=true;event.preventDefault();act({road:taskId});}});
+      map.on('mouseenter',id,()=>{if(ctx?.classroomSpatial&&!isCapturing())map.getCanvas().style.cursor='pointer';});
+      map.on('mouseleave',id,()=>map.getCanvas().style.cursor=isCapturing()?'crosshair':'');
+    }
+  }
+  function setClassroomLayers(value={}){
+    if(value.roads!==undefined)classroomLayers.roads=!!value.roads;
+    if(value.floods!==undefined)classroomLayers.floods=!!value.floods;
+    applyClassroomHazardVisibility();
+  }
+  function applyClassroomHazardVisibility(){
+    if(!map||!loaded)return;
+    const active=!!ctx?.classroomSpatial&&visible.network;
+    for(const id of hazardFloodLayers)if(map.getLayer(id))map.setLayoutProperty(id,'visibility',active&&classroomLayers.floods?'visible':'none');
+    for(const id of hazardRoadLayers)if(map.getLayer(id))map.setLayoutProperty(id,'visibility',active&&classroomLayers.roads?'visible':'none');
+    updateHazardAnimation();
+  }
+  function stopHazardAnimation(){if(hazardTimer){clearTimeout(hazardTimer);hazardTimer=null;}}
+  function canAnimateHazards(){return loaded&&ctx?.classroomSpatial&&visible.network&&classroomLayers.floods&&visible.weather&&!document.hidden&&!reducedMotion.matches&&hazardInView&&host?.isConnected&&host.getClientRects().length>0&&map.getZoom()>=14;}
+  function updateHazardAnimation(){
+    if(!canAnimateHazards()){stopHazardAnimation();if(loaded&&map.getLayer('classroom-water-ripples'))map.setPaintProperty('classroom-water-ripples','line-opacity',.36);return;}
+    if(hazardTimer)return;
+    const tick=()=>{hazardTimer=null;if(!canAnimateHazards())return;const phase=Date.now()/3400;map.setPaintProperty('classroom-water-ripples','line-opacity',.3+Math.sin(phase)*.11);map.setPaintProperty('classroom-water-glint','fill-opacity',.3+Math.sin(phase+.7)*.06);hazardTimer=setTimeout(tick,1100);};
+    hazardTimer=setTimeout(tick,1100);
+  }
+  function clearClassroomHazards(){
+    if(!hazardSignature)return;
+    hazardSignature='';for(const source of hazardSources)map.getSource(source)?.setData(empty());stopHazardAnimation();applyClassroomHazardVisibility();
   }
   function addGeographyLabels(collection){
     // Local Chinese text, with priorities and screen-space collision checks.
@@ -487,11 +791,11 @@ window.FloodGeoScene = (() => {
     window.dispatchEvent(new CustomEvent('command-annotations-remove',{detail:{ids:[String(id)]}}));
   }
   function currentWeather(){
-    const w=ctx?.realLab?{...localWeather,type:FloodRealLab.current().script.rain?'rain':'clear',rain:FloodRealLab.current().script.rain}:ctx?.command?.weather||localWeather;
+    const w=ctx?.classroomSpatial?{...localWeather,type:ctx.state.rain?'rain':'clear',rain:ctx.state.rain}:ctx?.realLab?{...localWeather,type:FloodRealLab.current().script.rain?'rain':'clear',rain:FloodRealLab.current().script.rain}:ctx?.command?.weather||localWeather;
     return {type:['clear','cloud','rain','fog'].includes(w.type)?w.type:'clear',rain:Math.max(0,Math.min(150,Number(w.rain)||0)),night:!!w.night};
   }
   function changeWeather(change){
-    if(ctx?.realLab){if(change.night!==undefined)localWeather.night=change.night;applyWeather();return;}
+    if(ctx?.realLab||ctx?.classroomSpatial){if(change.night!==undefined)localWeather.night=change.night;applyWeather();return;}
     const next={...currentWeather(),...change};localWeather=next;
     window.dispatchEvent(new CustomEvent('command-weather',{detail:next}));
     // The command UI owns persistence. Its handler may update ctx synchronously.
@@ -501,16 +805,18 @@ window.FloodGeoScene = (() => {
     const w=currentWeather(),overlay=document.querySelector('.geo-atmosphere');
     if(overlay){overlay.dataset.weather=visible.weather?w.type:'clear';overlay.classList.toggle('is-night',visible.weather&&w.night);overlay.style.setProperty('--rain-opacity',String(.2+w.rain/190));overlay.hidden=!visible.weather;}
     document.querySelectorAll('[data-geo-weather]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.geoWeather===w.type)));
-    const range=document.querySelector('[data-geo-rain]');if(range){range.value=w.rain;range.disabled=!!ctx?.realLab;}
+    const range=document.querySelector('[data-geo-rain]');if(range){range.value=w.rain;range.disabled=!!ctx?.realLab||!!ctx?.classroomSpatial;}
     const output=document.querySelector('[data-geo-rain-value]');if(output)output.textContent=w.rain;
     const night=document.querySelector('[data-geo-night]');if(night)night.checked=w.night;
     if(map&&loaded)map.setLight({anchor:'viewport',color:w.night?'#a8c5e6':'#ffffff',intensity:w.night?.15:.45,position:[1.5,w.night?45:210,w.night?75:35]});
-    if(visible.weather&&w.type==='rain'&&w.rain>0&&!rainFrame)rainFrame=requestAnimationFrame(drawRain);
-    if((!visible.weather||w.type!=='rain'||!w.rain)&&rainFrame){cancelAnimationFrame(rainFrame);rainFrame=null;rainDrops=[];if(weatherCanvas)weatherCanvas.getContext('2d')?.clearRect(0,0,weatherCanvas.width,weatherCanvas.height);}
+    if(visible.weather&&w.type==='rain'&&w.rain>0&&!document.hidden&&!reducedMotion.matches&&hazardInView&&weatherCanvas?.getClientRects().length&&!rainFrame)rainFrame=requestAnimationFrame(drawRain);
+    if(!visible.weather||w.type!=='rain'||!w.rain||document.hidden||reducedMotion.matches||!hazardInView)stopRain();
+    updateHazardAnimation();
   }
+  function stopRain(){if(rainFrame){cancelAnimationFrame(rainFrame);rainFrame=null;}rainDrops=[];if(weatherCanvas)weatherCanvas.getContext('2d')?.clearRect(0,0,weatherCanvas.width,weatherCanvas.height);}
   function drawRain(time){
     rainFrame=null;const w=currentWeather();
-    if(!weatherCanvas?.isConnected||!visible.weather||w.type!=='rain'||!w.rain)return;
+    if(!weatherCanvas?.isConnected||!visible.weather||w.type!=='rain'||!w.rain||document.hidden||reducedMotion.matches||!hazardInView||!weatherCanvas.getClientRects().length)return;
     if(time-rainLast<32){rainFrame=requestAnimationFrame(drawRain);return;}rainLast=time;
     const rect=weatherCanvas.getBoundingClientRect(),ratio=Math.min(window.devicePixelRatio||1,2),width=rect.width,height=rect.height;if(!width||!height)return;
     if(weatherCanvas.width!==Math.round(width*ratio)||weatherCanvas.height!==Math.round(height*ratio)){weatherCanvas.width=Math.round(width*ratio);weatherCanvas.height=Math.round(height*ratio);rainDrops=[];}
@@ -542,10 +848,11 @@ window.FloodGeoScene = (() => {
     if(!loaded)return;
     showNetwork=visible.network;
     for(const id of ['teaching-roads','teaching-roads-halo','flood-areas','flood-depth'])map.setLayoutProperty(id,'visibility',visible.network?'visible':'none');
+    applyClassroomHazardVisibility();
     for(const id of ['building-footprints','buildings-3d','scene-roofs','scene-windows'])map.setLayoutProperty(id,'visibility',visible.buildings&&(visible.detail||!id.startsWith('scene-'))?'visible':'none');
     for(const id of ['scene-trees','scene-road-center','scene-crosswalks','scene-shadows'])map.setLayoutProperty(id,'visibility',visible.detail?'visible':'none');
     const trainingVisible=visible.network&&!ctx?.command;
-    markers.filter(m=>!m._geoLabel).forEach(m=>{m.getElement().hidden=!trainingVisible;});roads.forEach(m=>{m.getElement().hidden=!trainingVisible||!labels;});crewMarkers.forEach(m=>{m.getElement().hidden=!trainingVisible;});
+    markers.filter(m=>!m._geoLabel).forEach(m=>{m.getElement().hidden=!trainingVisible;});roads.forEach(m=>{m.getElement().hidden=!trainingVisible||!labels;});crewMarkers.forEach(m=>{m.getElement().hidden=!trainingVisible||(ctx?.classroomSpatial&&ctx.forcesVisible===false);});
     for(const id of ['command-routes','command-routes-halo'])map.setLayoutProperty(id,'visibility',visible.command?'visible':'none');commandMarkers.forEach(m=>{m.getElement().hidden=!visible.command;});
     syncAnnotations();applyWeather();updateReadout();
   }
@@ -557,7 +864,7 @@ window.FloodGeoScene = (() => {
     const color=document.querySelector('[data-geo-color]');if(color)color.value=drawingColor;
   }
   function setLocationPicker(callback){cancelDrawing();locationCallback=typeof callback==='function'?callback:null;popup?.remove();updateDrawingReadout();}
-  function focusLocation(coordinate,title){if(!map||!validCoordinate(coordinate))return;stopTour();map.flyTo({center:coordinate,zoom:16.8,pitch:mode==='flat'?0:58,bearing:-18,duration:1100});if(title){popup?.remove();popup=new maplibregl.Popup().setLngLat(coordinate).setHTML(`<div class="geo-tooltip"><b>${escape(title)}</b></div>`).addTo(map);}}
+  function focusLocation(coordinate,title,options={}){if(!map||!validCoordinate(coordinate))return;stopTour();map.flyTo({center:coordinate,zoom:options.zoom||16.8,pitch:mode==='flat'?0:58,bearing:-18,duration:1100});if(title){popup?.remove();popup=new maplibregl.Popup().setLngLat(coordinate).setHTML(`<div class="geo-tooltip"><b>${escape(title)}</b></div>`).addTo(map);}}
   function exportSceneImage(){
     if(!map||!loaded)return null;
     const source=map.getCanvas(),canvas=document.createElement('canvas');canvas.width=source.width;canvas.height=source.height;const out=canvas.getContext('2d');out.drawImage(source,0,0);const ratio=source.width/source.clientWidth;
@@ -569,19 +876,32 @@ window.FloodGeoScene = (() => {
     out.fillStyle='rgba(7,25,35,.88)';out.fillRect(0,source.clientHeight-34,source.clientWidth,34);out.fillStyle='#e3f4f7';out.font='11px "Microsoft YaHei",sans-serif';out.fillText('徐州云龙湖 · 洪涝应急教学场景  |  虚拟灾情与教学通道，非实际应急导航',14,source.clientHeight-13);
     return canvas.toDataURL('image/png');
   }
+  let classroomBuildings;
+  function syncSelectedBuilding(id){
+    if(!map.getSource('classroom-selected-building')){map.addSource('classroom-selected-building',{type:'geojson',data:empty()});map.addLayer({id:'classroom-selected-building',type:'fill-extrusion',source:'classroom-selected-building',paint:{'fill-extrusion-color':'#22a5b1','fill-extrusion-height':['get','height'],'fill-extrusion-opacity':.42,'fill-extrusion-vertical-gradient':false}});map.addLayer({id:'classroom-selected-building-outline',type:'line',source:'classroom-selected-building',paint:{'line-color':'#b9e5dc','line-width':2.5}});}
+    if(!classroomBuildings)classroomBuildings=window.FloodClassroomNetwork.buildingCatalog(fullData.buildings);
+    const item=classroomBuildings.find(id);map.getSource('classroom-selected-building').setData(item?{type:'FeatureCollection',features:[{type:'Feature',properties:{height:item.height+.6},geometry:item.geometry}]}:empty());
+  }
+  function setClassroomForcesVisible(value){if(ctx?.classroomSpatial){ctx.forcesVisible=!!value;crewMarkers.forEach(marker=>marker.getElement().hidden=!visible.network||!value);}}
   function syncClassroom(){
-    const s=ctx.state,spatial=ctx.classroomSpatial,E=window.FloodLab;
+    const s=ctx.state,spatial=ctx.classroomSpatial,E=window.FloodLab,points=spatial.points||window.FloodGeography.points;
+    syncSelectedBuilding(ctx.selectedBuilding);
     const network=window.FloodRoadRouting.network(),byId=new Map(network.map(segment=>[segment.id,segment]));
     const affected=spatial.roadStates.map(road=>{const segment=byId.get(road.id);return segment?{type:'Feature',properties:{id:road.id,state:road.status,color:colors[road.status],taskIds:road.taskIds.join(',')},geometry:{type:'LineString',coordinates:[segment.a,segment.b]}}:null;}).filter(Boolean);
     map.getSource('teaching').setData({type:'FeatureCollection',features:affected});
-    const pools=spatial.tasks.filter(task=>task.point&&!task.repaired&&(task.damage||task.depth>=.15||task.working)).map(task=>{
-      const p=task.point,r=task.radius,ring=Array.from({length:49},(_,i)=>{const a=i*Math.PI/24;return [p[0]+Math.cos(a)*r/(111320*Math.cos(p[1]*Math.PI/180)),p[1]+Math.sin(a)*r/110574];});
-      return {type:'Feature',properties:{id:task.id,height:Math.max(.05,task.depth)},geometry:{type:'Polygon',coordinates:[ring]}};
-    });
-    map.getSource('flood-areas').setData({type:'FeatureCollection',features:pools});
+    // The scene uses the same segment closures as route calculation. Flood
+    // geometry follows nearby streets, while dry structural damage stays dry.
+    map.getSource('flood-areas').setData(empty());
+    const signature=JSON.stringify([spatial.tasks,spatial.roadStates,s.edges]);
+    if(signature!==hazardSignature&&window.FloodHazardScene){
+      const scene=window.FloodHazardScene.build({tasks:spatial.tasks,roadStates:spatial.roadStates,segments:network,edges:s.edges});
+      const names={water:'classroom-water',ripples:'classroom-ripples',breaks:'classroom-breaks',debris:'classroom-debris',barriers:'classroom-barriers',closurePoints:'classroom-closure-points',restored:'classroom-restored'};
+      for(const [name,source]of Object.entries(names))map.getSource(source).setData(scene[name]||empty());
+      hazardSignature=signature;
+    }
     markers.filter(marker=>!marker._geoLabel).forEach(marker=>marker.remove());markers=markers.filter(marker=>marker._geoLabel);
     const reachable=new Set(ctx.reachableNodes||[]);
-    for(const node of E.nodes){
+    for(const node of ctx.classroomNodes||E.nodesFor(s)){
       const el=document.createElement('button');el.className='geo-marker kind-'+node.kind+(!reachable.has(node.id)?' isolated':'')+(s.selection.includes(node.id)?' selected':'');el.type='button';el.dataset.node=node.id;el.setAttribute('aria-label',node.name+'，教学地点');
       el.innerHTML='<i class="geo-pin-ground" aria-hidden="true"></i><span class="marker-icon">'+(s.selection.includes(node.id)?'✓':symbols[node.kind]||node.id)+'</span><span class="marker-label">'+escape(node.name)+'<small>'+node.pop+' 人 · 教学地点</small></span>';
       el.querySelector('.marker-label').hidden=!labels;markers.push(new maplibregl.Marker({element:el}).setLngLat(points[node.id]).addTo(map));
@@ -590,8 +910,10 @@ window.FloodGeoScene = (() => {
     const visibleTasks=spatial.tasks.filter(task=>task.status!=='open'||task.working||ctx.selectedRoad===task.id);
     for(const task of visibleTasks){
       if(!task.point)continue;
-      const edge=s.edges.find(edge=>edge.id===task.id),status=edge?E.status(s,edge):task.status,el=document.createElement('button');el.className='geo-road-marker';el.dataset.road=task.id;el.textContent=task.id;el.title=task.id+' · 局部作业区 · '+titles[status];el.style.setProperty('--road-color',colors[status]);el.hidden=!labels||!showNetwork;
-      roads.push(new maplibregl.Marker({element:el,offset:[0,24+(visibleTasks.filter(other=>other.point&&distanceMeters(other.point,task.point)<10).findIndex(other=>other.id===task.id))*28]}).setLngLat(task.point).addTo(map));
+      const edge=s.edges.find(edge=>edge.id===task.id),status=edge?E.status(s,edge):task.status,el=document.createElement('button');
+      const label=task.repaired?'已抢通':task.working?'抢通作业':status==='blocked'?(task.damage?'道路损毁 · 禁止通行':'积水封路 · 禁止通行'):status==='limited'?'积水限行':'正常通行';
+      el.className='geo-road-marker geo-hazard-label '+(task.working?'repair':status);el.dataset.road=task.id;el.innerHTML=`<b>${escape(task.id)}</b><span>${task.id.startsWith('F')?escape(task.title)+' · ':''}${escape(label)}${task.depth>=.15?' · '+Number(task.depth).toFixed(2)+' m':''}</span>`;el.title=task.id+' · '+(task.title||'')+' · '+label+'，点击处理此处灾情';el.style.setProperty('--road-color',colors[status]);el.hidden=!labels||!showNetwork;
+      roads.push(new maplibregl.Marker({element:el,anchor:'left',offset:[19,24+(visibleTasks.filter(other=>other.point&&distanceMeters(other.point,task.point)<10).findIndex(other=>other.id===task.id))*28]}).setLngLat(task.point).addTo(map));
     }
     commandMarkers.forEach(marker=>marker.remove());commandMarkers=[];crewMarkers.forEach(marker=>marker.remove());crewMarkers=[];
     const routes=[],access=[];
@@ -605,9 +927,11 @@ window.FloodGeoScene = (() => {
       const job=crew.job,route=job.route,traveling=s.time<job.start+job.travel;
       const coordinate=pointAlongRoute(route.coordinates,traveling?(s.time-job.start)/Math.max(1,job.travel):1);
       if(!coordinate)continue;
-      addRoute(route,'#1f7eac');const el=document.createElement('span');el.className='geo-crew-marker';el.textContent=traveling?'🚚':'⚒';el.title=crew.name+' · '+(traveling?'沿确认的真实道路进场':'作业区外围现场作业')+' · T+'+job.end+'完成';
+      addRoute(route,'#1f7eac');const el=document.createElement('button');el.type='button';el.dataset.learningCrew=crew.id;el.className='geo-crew-marker geo-force-marker';el.innerHTML='<b>'+(traveling?'↗':'⚒')+'</b><span>'+escape(crew.name)+'<small>'+(crew.people==null?'人数未记录':crew.people+'人')+' · '+(traveling?'进场':'作业')+'</small></span>';el.title=crew.name+' · '+(traveling?'沿确认的真实道路进场':'作业区外围现场作业')+' · T+'+job.end+'完成';
       crewMarkers.push(new maplibregl.Marker({element:el,offset:[0,-18]}).setLngLat(coordinate).addTo(map));
     }
+    const idleByBase=new Map();for(const crew of s.crews.filter(c=>!c.job)){const base=crew.baseNode||'S';if(!idleByBase.has(base))idleByBase.set(base,[]);idleByBase.get(base).push(crew);}
+    for(const [base,units] of idleByBase){if(!points[base])continue;const el=document.createElement('button');el.type='button';el.className='geo-force-marker geo-force-base';el.dataset.learningForceBase=base;el.innerHTML='<b>队</b><span>'+units.length+'支待命<small>'+units.reduce((sum,c)=>sum+(c.people??16),0)+'人 · '+units.reduce((sum,c)=>sum+(c.vehicles??3),0)+'车</small></span>';el.title=(ctx.classroomNodes||E.nodesFor(s)).find(n=>n.id===base)?.name+' · 点击查看驻地力量';crewMarkers.push(new maplibregl.Marker({element:el,anchor:'bottom',offset:[0,-44]}).setLngLat(points[base]).addTo(map));}
     if(!map.getSource('classroom-access')){map.addSource('classroom-access',{type:'geojson',data:empty()});map.addLayer({id:'classroom-access',type:'line',source:'classroom-access',paint:{'line-color':'#805f46','line-width':2,'line-dasharray':[2,3]}});}
     map.getSource('classroom-access').setData({type:'FeatureCollection',features:access});
     map.getSource('command-routes').setData({type:'FeatureCollection',features:routes});
@@ -635,6 +959,7 @@ window.FloodGeoScene = (() => {
   }
   function sync(){
     if(!loaded||!ctx)return;
+    if(!ctx.classroomSpatial)clearClassroomHazards();
     if(ctx.realLab){syncRealLab();return;}
     if(ctx.classroomSpatial){syncClassroom();return;}
     map.getSource('classroom-access')?.setData(empty());
@@ -673,6 +998,8 @@ window.FloodGeoScene = (() => {
     const z=map.getZoom(),p=map.getPitch();
     const label=document.querySelector('[data-geo-zoom-label]');if(label)label.textContent=z<15?'区域总览 · 2D':p>15?'街区建筑 · 3D':'街区地图 · 2D';
     const altitude=document.querySelector('[data-geo-altitude]');if(altitude)altitude.textContent=`缩放 ${z.toFixed(1)} · 倾角 ${Math.round(p)}° · ${z<15?'滚轮拉近进入建筑场景':'右键拖动旋转 / 调整倾角'}`;
+    updateHazardAnimation();
+    if(ctx?.classroomSpatial)for(const marker of roads){const el=marker.getElement();el.classList.toggle('geo-hazard-compact',z<15.7&&ctx.selectedRoad!==el.dataset.road);}
     updateGeographyLabels(z);
   }
   function flyTo(preset){
@@ -684,6 +1011,7 @@ window.FloodGeoScene = (() => {
     map.flyTo({...options,duration:1700,essential:false});
   }
   function focus(id){
+    const points=ctx?.classroomSpatial?.points||window.FloodGeography.points;
     if(!map||!points[id])return;
     stopTour();map.flyTo({center:points[id],zoom:17,pitch:mode==='flat'?0:58,bearing:-18,duration:1600});
   }
@@ -693,7 +1021,7 @@ window.FloodGeoScene = (() => {
     const element=event.target.closest('.geo-marker,.geo-road-marker,.geo-command-marker');if(!element||!map)return;
     event.preventDefault();event.stopImmediatePropagation();
     const rect=map.getCanvas().getBoundingClientRect(),point=map.unproject([event.clientX-rect.left,event.clientY-rect.top]);
-    const coordinate=points[element.dataset.node]||(element.dataset.geoLng?[Number(element.dataset.geoLng),Number(element.dataset.geoLat)]:[point.lng,point.lat]);consumeCoordinate(coordinate);
+    const coordinate=(ctx?.classroomSpatial?.points||points)[element.dataset.node]||(element.dataset.geoLng?[Number(element.dataset.geoLng),Number(element.dataset.geoLat)]:[point.lng,point.lat]);consumeCoordinate(coordinate);
   },true);
   document.addEventListener('click',event=>{
     const button=event.target.closest('[data-camera-mode],[data-camera-preset],[data-geo-action],[data-focus-node],[data-geo-draw],[data-geo-basemap],[data-geo-weather],[data-geo-delete-annotation]');if(!button)return;
@@ -729,7 +1057,9 @@ window.FloodGeoScene = (() => {
   document.addEventListener('keydown',event=>{if(event.key==='Escape'&&isCapturing()){event.preventDefault();cancelDrawing();}if(event.key==='Enter'&&drawing&&event.target===document.body){event.preventDefault();finishDrawing();}});
   window.addEventListener('resize',()=>map?.resize());
   document.addEventListener('fullscreenchange',()=>setTimeout(()=>map?.resize(),80));
-  return {template,detach,mount,focus,focusLocation,coverRegion,fitCoveredBounds,constrainCoverage,getMap:()=>map,getData:()=>fullData,getPoints:()=>points,getCoverageBounds:()=>BOUNDS.map(point=>[...point]),
+  document.addEventListener('visibilitychange',()=>{applyWeather();updateHazardAnimation();});
+  reducedMotion.addEventListener?.('change',()=>{applyWeather();updateHazardAnimation();});
+  return {template,detach,mount,focus,focusLocation,coverRegion,fitCoveredBounds,constrainCoverage,setClassroomForcesVisible,setClassroomLayers,getClassroomHazardLayers:()=>({floods:[...hazardFloodLayers],roads:[...hazardRoadLayers]}),getMap:()=>map,getData:()=>fullData,getPoints:()=>points,getCoverageBounds:()=>BOUNDS.map(point=>[...point]),
     onAnnotation:callback=>{annotationCallback=typeof callback==='function'?callback:null;},setDrawing,
     getAnnotationDraft:()=>drawing?{...buildDrawing(),color:drawing.color,mode:drawing.mode,coordinates:drawing.coordinates.map(p=>[...p])}:null,
     setLocationPicker,exportSceneImage};

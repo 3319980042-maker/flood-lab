@@ -282,7 +282,7 @@
     }
     return line.at(-1).slice();
   }
-  function create({ router, points, nodes, edges, dataVersion = 'offline-local' }) {
+  function createBase({ router, points, nodes, edges, hazards = [], dataVersion = 'offline-local' }) {
     if (!router?.network || !router.findFixed || !router.snapToComponent) throw new Error('课堂需要支持固定道路接入口的真实路由器');
     const network = router.network(), segments = new Map(network.map(segment => [segment.id, segment]));
     const adjacency = new Map(), componentVertices = new Map();
@@ -307,12 +307,13 @@
     const tasks = new Map(edges.map(edge => {
       const baseline = baselineRoutes.get(edge.id);
       const target = nodeMap.get(edge.b)?.pop > 0 ? edge.b : nodeMap.get(edge.a)?.pop > 0 ? edge.a : null;
-      const rawPoint = target ? access.get(target)?.point : midpointAlong(baseline?.roadCoordinates);
+      const custom = hazards.find(hazard => hazard.id === edge.id);
+      const rawPoint = custom?.point || (target ? access.get(target)?.point : midpointAlong(baseline?.roadCoordinates));
       const attachment = rawPoint ? router.snapToComponent(rawPoint, mainComponent) : null;
       const point = attachment?.point || null;
       return [edge.id, {
-        id: edge.id, a: edge.a, b: edge.b, target, point, radius: WORK_RADIUS_METERS,
-        segmentIds: point ? network.filter(segment => segment.component === mainComponent && distanceToSegment(point, segment) <= WORK_RADIUS_METERS).map(segment => segment.id) : []
+        id: edge.id, title: custom?.title || edge.id, a: edge.a, b: edge.b, target, point, radius: custom?.radius || WORK_RADIUS_METERS,
+        segmentIds: point ? network.filter(segment => segment.component === mainComponent && distanceToSegment(point, segment) <= (custom?.radius || WORK_RADIUS_METERS)).map(segment => segment.id) : []
       }];
     }));
     const caches = new Map();
@@ -370,23 +371,25 @@
       }
       return current.routes.get(key);
     }
-    function workRoute(state, edge) {
+    function workRoute(state, edge, crew) {
+      const base = crew?.baseNode || 'S';
+      const cacheKey = edge.id + '>' + base;
       const current = conditions(state), task = tasks.get(edge.id);
-      if (current.workRoutes.has(edge.id)) return current.workRoutes.get(edge.id);
+      if (current.workRoutes.has(cacheKey)) return current.workRoutes.get(cacheKey);
       let best = null;
-      if (task?.point && task.segmentIds.length && access.get('S') && !current.blocked.has(access.get('S').segmentId)) {
+      if (task?.point && task.segmentIds.length && access.get(base) && !current.blocked.has(access.get(base).segmentId)) {
         const candidates = network.filter(segment => segment.component === mainComponent && !current.blocked.has(segment.id))
           .map(segment => ({ segment, point: mid(segment), distance: meters(mid(segment), task.point) }))
           .filter(candidate => candidate.distance <= task.radius + 350)
           .sort((a, b) => a.distance - b.distance || a.segment.id - b.segment.id).slice(0, 24);
         for (const candidate of candidates) {
           const attachment = { segmentId: candidate.segment.id, t: .5 };
-          const result = router.findFixed(points.S, candidate.point, access.get('S'), attachment, current);
+          const result = router.findFixed(points[base], candidate.point, access.get(base), attachment, current);
           if (result && (!best || result.minutes < best.minutes || result.minutes === best.minutes && result.totalDistanceKm < best.totalDistanceKm)) best = result;
         }
       }
-      current.workRoutes.set(edge.id, best ? freeze({ ...best, routingModel: MODEL_ID, dataVersion }) : null);
-      return current.workRoutes.get(edge.id);
+      current.workRoutes.set(cacheKey, best ? freeze({ ...best, routingModel: MODEL_ID, dataVersion }) : null);
+      return current.workRoutes.get(cacheKey);
     }
     function canDispatch(state, edge, crew) {
       if (typeof edge === 'string') edge = state.edges.find(candidate => candidate.id === edge);
@@ -394,13 +397,13 @@
       if (!edge || !crew) return '道路或队伍不存在';
       const task = tasks.get(edge.id);
       if (!task?.point || !task.segmentIds.length) return '作业区没有接入已收录的真实机动车道路';
-      return workRoute(state, edge) ? null : '作业区外围没有真实可达的进场道路，请先处理其他阻断';
+      return workRoute(state, edge, crew) ? null : '作业区外围没有真实可达的进场道路，请先处理其他阻断';
     }
     function dispatchEstimate(state, edge, crew) {
       if (typeof edge === 'string') edge = state.edges.find(candidate => candidate.id === edge);
       if (typeof crew === 'string') crew = state.crews.find(candidate => candidate.id === crew);
       const error = canDispatch(state, edge, crew); if (error) return { error };
-      const result = workRoute(state, edge), task = tasks.get(edge.id);
+      const result = workRoute(state, edge, crew), task = tasks.get(edge.id);
       const workMinutes = edge.work / crew.speed, travelMinutes = result.minutes, duration = Math.ceil(workMinutes + travelMinutes);
       return { travelMinutes, workMinutes, duration, completionAt: state.time + duration, route: result, workPoint: task.point.slice(), travelDistanceKm: result.distanceKm };
     }
@@ -411,7 +414,7 @@
         const edgeMap = new Map(state.edges.map(edge => [edge.id, edge]));
         current.sceneSignature = sceneSignature;
         current.scene = freeze({
-          modelId: MODEL_ID, dataVersion, mainComponent,
+          modelId: MODEL_ID, dataVersion, mainComponent, points: JSON.parse(JSON.stringify(points)),
           roadStates: [...current.roadStates.values()].map(road => ({ ...road, taskIds: road.taskIds.slice() })),
           tasks: current.taskStates.map(task => ({ ...task, depth: edgeMap.get(task.id).depth, damage: !!edgeMap.get(task.id).damage, point: task.point?.slice() || null, segmentIds: task.segmentIds.slice() })),
           corridors: Object.fromEntries([...baselineRoutes].map(([id, result]) => [id, result ? { ...result, routingModel: MODEL_ID, dataVersion } : null])),
@@ -423,7 +426,48 @@
     }
     return { modelId: MODEL_ID, dataVersion, reachable, route, canDispatch, dispatchEstimate, scene };
   }
-  return { create };
+
+  // A deterministic catalogue identifies an actual polygon, not a browser-supplied coordinate.
+  function buildingCatalog(collection) {
+    const entries = [];
+    for (const [featureIndex, feature] of (collection?.features || []).entries()) {
+      const parts = feature.geometry?.type === 'Polygon' ? [feature.geometry.coordinates] : feature.geometry?.type === 'MultiPolygon' ? feature.geometry.coordinates : [];
+      for (const [partIndex, coordinates] of parts.entries()) {
+        const ring = coordinates[0]; if (!ring?.length) continue;
+        let crossSum=0,x=0,y=0;
+        const origin=ring[0];
+        for(let i=1;i<ring.length;i++) {const a=[ring[i-1][0]-origin[0],ring[i-1][1]-origin[1]],b=[ring[i][0]-origin[0],ring[i][1]-origin[1]],c=a[0]*b[1]-b[0]*a[1];crossSum+=c;x+=(a[0]+b[0])*c;y+=(a[1]+b[1])*c;}
+        const point=Math.abs(crossSum)>1e-18?[origin[0]+x/(3*crossSum),origin[1]+y/(3*crossSum)]:origin.slice();
+        entries.push({id:'building-'+featureIndex+'-'+partIndex,name:String(feature.properties?.['name:zh']||feature.properties?.name||'地图建筑 '+(entries.length+1)).slice(0,80),point,height:Number(feature.properties?.render_height)||9,geometry:{type:'Polygon',coordinates}});
+      }
+    }
+    const index=new Map(entries.map(entry=>[entry.id,entry]));
+    return {entries,find:id=>index.get(id)||null};
+  }
+  function create(options) {
+    const catalogue=buildingCatalog(options.buildings), cache=new Map();
+    function adapter(state) {
+      const overrides=state.siteOverrides||{},signature=JSON.stringify([overrides,state.customHazards||[]]);
+      if(cache.has(signature))return cache.get(signature);
+      const points=Object.fromEntries(Object.entries(options.points).map(([id,point])=>[id,(overrides[id]?.point||point).slice()]));
+      const nodes=options.nodes.map(node=>({...node,...overrides[node.id],id:node.id,kind:node.kind}));
+      const extras=(state.customHazards||[]).map(h=>({id:h.id,a:h.a,b:h.b,length:1,depth:h.depth,damage:h.damage,type:h.type,work:h.work,cost:h.cost,repaired:false}));
+      const result=createBase({...options,points,nodes,edges:[...options.edges,...extras],hazards:state.customHazards||[]});cache.set(signature,result);
+      if(cache.size>12)cache.delete(cache.keys().next().value);
+      return result;
+    }
+    function resolveBuilding(id) {
+      const entry=catalogue.find(id); if(!entry)return null;
+      const main=adapter({}).scene({edges:[],crews:[]}).mainComponent;
+      const access=options.router.snapToComponent(entry.point,main);
+      return {...entry,accessMeters:access?Math.round(access.d*1000):null};
+    }
+    function locateHazard(point){const main=adapter({}).scene({edges:[],crews:[]}).mainComponent;const access=options.router.snapToComponent(point,main);return access?{point:access.point.slice(),distanceMeters:Math.round(access.d*1000)}:null;}
+    const result={modelId:MODEL_ID,dataVersion:options.dataVersion||'offline-local',resolveBuilding,locateHazard};
+    for(const method of ['reachable','route','canDispatch','dispatchEstimate','scene']) result[method]=(state,...args)=>adapter(state)[method](state,...args);
+    return result;
+  }
+  return { create, buildingCatalog };
 });
 
 ;

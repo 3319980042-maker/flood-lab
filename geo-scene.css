@@ -29,6 +29,15 @@ body[data-page=scene] main{padding:20px 24px 12px}body[data-page=scene] .topline
 /* Keep the map-owned transform on a fixed footprint. Labels never size the anchor. */
 .geo-marker.maplibregl-marker,.geo-command-marker.maplibregl-marker{position:absolute;display:block;width:20px;height:20px;min-width:20px;max-width:20px;min-height:20px;padding:0;overflow:visible;text-align:left;line-height:1;box-sizing:border-box}
 .geo-pin-ground{position:absolute;left:50%;top:50%;width:8px;height:8px;transform:translate(-50%,-50%);border:2px solid #304957;border-radius:50%;background:var(--pin,#32291a);box-shadow:0 1px 5px #00000099;pointer-events:none;z-index:2}
+.geo-hazard-label.maplibregl-marker{display:flex;align-items:center;gap:0;max-width:236px;min-height:29px;padding:0;border:1px solid #975f50;border-radius:3px;background:#fff9edeF;color:#69392d;box-shadow:0 2px 7px #182f3d4d;font:600 10px/1.5 "Microsoft YaHei",sans-serif;text-align:left;overflow:visible;white-space:nowrap}
+.geo-hazard-label.maplibregl-marker>b{align-self:stretch;display:grid;place-items:center;min-width:31px;padding:4px 6px;background:#9b3632;color:#fff8e7;font-size:10px;letter-spacing:.2px}
+.geo-hazard-label.maplibregl-marker>span{display:block;max-width:200px;padding:4px 7px;overflow:hidden;text-overflow:ellipsis}
+.geo-hazard-label.geo-hazard-compact.maplibregl-marker>span{display:none}
+.geo-hazard-label.maplibregl-marker.limited{border-color:#a77527;color:#79521e}.geo-hazard-label.maplibregl-marker.limited>b{background:#a97723}
+.geo-hazard-label.maplibregl-marker.repair{border-color:#477b98;color:#35657c}.geo-hazard-label.maplibregl-marker.repair>b{background:#386d8a}
+.geo-hazard-label.maplibregl-marker.open{border-color:#34775a;color:#27694b}.geo-hazard-label.maplibregl-marker.open>b{background:#2d7951}
+.geo-hazard-label.maplibregl-marker:hover{background:#fffef8;border-color:#68483c;box-shadow:0 3px 10px #182f3d70}
+@media(max-width:760px){.geo-hazard-label.maplibregl-marker{max-width:190px;min-height:28px;font-size:9px}.geo-hazard-label.maplibregl-marker>b{min-width:28px;padding:4px}.geo-hazard-label.maplibregl-marker>span{max-width:162px;padding:4px 6px}}
 .geo-marker.maplibregl-marker:after,.geo-command-marker.maplibregl-marker:after{content:"";position:absolute;left:50%;bottom:50%;width:1px;height:14px;background:var(--pin,#32291a);pointer-events:none}
 .geo-marker.maplibregl-marker .marker-icon{position:absolute;left:50%;bottom:calc(100% + 4px);transform:translateX(-50%);margin:0}
 .geo-marker.maplibregl-marker .marker-icon:after{display:none}
